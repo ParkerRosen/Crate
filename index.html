@@ -99,7 +99,21 @@ input:focus{outline:none;border-color:var(--accent)}
 
 /* home */
 .intro{padding:6px 0 4px}
-.tools{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0 26px}
+.tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:18px 0 26px}
+.tool.data{border-style:dashed}
+.card{background:var(--surface);border:1.5px solid var(--line);border-radius:16px;padding:16px;display:grid;gap:12px;margin:14px 0}
+.card h2{margin:0}
+.card p{margin:0}
+.card .steps{margin:0}
+.status{display:grid;grid-template-columns:10px minmax(0,1fr);column-gap:10px;align-items:start;font-weight:600;font-variant-numeric:tabular-nums}
+.status small{grid-column:2;font-weight:500;color:var(--muted)}
+.led{width:10px;height:10px;border-radius:50%;background:var(--line);margin-top:.45em}
+.led.on{background:var(--ok)}
+.filebtn{position:relative;overflow:hidden;justify-self:start}
+.filebtn input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%}
+.row-actions{display:flex;gap:8px;flex-wrap:wrap}
+details > summary{cursor:pointer;font-weight:650;color:var(--accent);padding:4px 0}
+details[open] > summary{margin-bottom:8px}
 .tool{text-align:left;border:1.5px solid var(--line);background:var(--surface);border-radius:14px;padding:14px;cursor:pointer;display:flex;flex-direction:column;gap:4px;min-height:44px}
 .tool:hover{border-color:var(--accent)}
 .tool b{font-family:var(--display);font-weight:720;font-size:18px;letter-spacing:-.01em}
@@ -224,7 +238,7 @@ label.row-grid{cursor:pointer}
 /* ---------------- small helpers ---------------- */
 const API = 'https://api.spotify.com/v1';
 const AUTH = 'https://accounts.spotify.com';
-const SCOPES = ['playlist-read-private','playlist-read-collaborative','playlist-modify-private','playlist-modify-public','user-library-read','user-library-modify','user-follow-modify'].join(' ');
+const SCOPES = ['playlist-read-private','playlist-read-collaborative','playlist-modify-private','playlist-modify-public','user-library-read','user-library-modify','user-follow-modify','user-read-recently-played'].join(' ');
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -294,6 +308,7 @@ async function tokenRequest(params) {
   const t = store.get('token') || {};
   t.access = j.access_token;
   if (j.refresh_token) t.refresh = j.refresh_token;
+  if (j.scope) t.scope = j.scope;
   t.exp = Date.now() + ((j.expires_in || 3600) - 60) * 1000;
   store.set('token', t);
 }
@@ -533,6 +548,356 @@ function findDupes(entries) {
   return { exact: [...exact.values()], similar: [...groups.values()].filter(g => g.length > 1) };
 }
 
+/* ---------------- extra data: genres, sound, listening history ---------------- */
+class SourceError extends Error {}
+const kv = (() => {
+  const mem = {};
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((res, rej) => {
+    try { const r = indexedDB.open('crate', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }
+    catch (e) { rej(e); }
+  }));
+  const tx = async (mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => { const t = db.transaction('kv', mode); const q = fn(t.objectStore('kv')); t.oncomplete = () => res(q?.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error); });
+  };
+  return {
+    async get(k) { try { const v = await tx('readonly', s => s.get(k)); return v === undefined ? mem[k] : v; } catch { return mem[k]; } },
+    async set(k, v) { mem[k] = v; try { await tx('readwrite', s => s.put(v, k)); } catch {} },
+    async del(k) { delete mem[k]; try { await tx('readwrite', s => s.delete(k)); } catch {} }
+  };
+})();
+const D = { genres: {}, feats: {}, hist: null };
+const dkey = k => `${S.mode}:${k}`;
+async function loadData() {
+  D.genres = {}; D.feats = {}; D.hist = null;
+  if (S.mode === 'demo') { D.hist = buildHistory([Demo.sampleHistory()]); return; }
+  D.genres = (await kv.get(dkey('genres'))) || {};
+  D.feats = (await kv.get(dkey('feats'))) || {};
+  D.hist = (await kv.get(dkey('hist'))) || null;
+}
+const saveData = k => S.mode === 'demo' ? Promise.resolve() : kv.set(dkey(k), D[k]);
+const LFM_DEFAULT_KEY = '';
+const lfmKey = () => store.get('lfmKey') || LFM_DEFAULT_KEY;
+const hasScope = s => S.mode === 'demo' || (store.get('token')?.scope || '').split(' ').includes(s);
+
+/* Last.fm (genres + optional play counts) */
+let lfmJsonp = false, lastLfm = 0;
+function jsonp(url) {
+  return new Promise((res, rej) => {
+    const cb = '__crate' + Math.random().toString(36).slice(2);
+    const s = document.createElement('script');
+    const done = () => { clearTimeout(t); delete window[cb]; s.remove(); };
+    const t = setTimeout(() => { done(); rej(new TypeError('timeout')); }, 15000);
+    window[cb] = j => { done(); res(j); };
+    const u = new URL(url); u.searchParams.set('callback', cb);
+    s.src = u; s.onerror = () => { done(); rej(new TypeError('jsonp failed')); };
+    document.head.appendChild(s);
+  });
+}
+async function lastfm(params) {
+  if (S.mode === 'demo') { await sleep(4); return Demo.lastfm(params); }
+  const key = lfmKey();
+  if (!key) throw new SourceError('Add your Last.fm API key on the Data sources page first.');
+  const u = new URL('https://ws.audioscrobbler.com/2.0/');
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  u.searchParams.set('api_key', key); u.searchParams.set('format', 'json');
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const gap = 230 - (Date.now() - lastLfm); if (gap > 0) await sleep(gap);
+    lastLfm = Date.now();
+    let j;
+    try { j = lfmJsonp ? await jsonp(u) : await (await fetch(u)).json(); }
+    catch (e) {
+      if (!lfmJsonp) { lfmJsonp = true; continue; }
+      if (attempt < 3) { await sleep(1500); continue; }
+      throw new SourceError('Couldn\'t reach Last.fm. Check your connection and try again.');
+    }
+    if (j?.error === 29 || j?.error === 16 || j?.error === 11) { await sleep(2500 * (attempt + 1)); continue; }
+    if (j?.error === 10 || j?.error === 26) throw new SourceError('Last.fm didn\'t accept your API key. Check it on the Data sources page.');
+    return j;
+  }
+  throw new SourceError('Last.fm is busy right now. Try again in a minute.');
+}
+
+const NOT_GENRE = new Set(['seen live', 'favorites', 'favourites', 'favorite', 'favourite', 'love', 'loved', 'beautiful', 'awesome', 'cool', 'amazing', 'good', 'great', 'best', 'catchy', 'sexy', 'fun', 'american', 'british', 'uk', 'usa', 'us', 'english', 'canadian', 'australian', 'swedish', 'german', 'french', 'japanese', 'korean', 'irish', 'scottish', 'norwegian', 'danish', 'dutch', 'spanish', 'italian', 'brazilian', 'mexican', 'female vocalists', 'male vocalists', 'female vocalist', 'male vocalist', 'female', 'male', 'all', 'spotify', 'albums i own', 'singer', 'band', 'composer', 'producer', 'rapper', 'dj', 'artist', 'music']);
+const BAD_TAG = /^\d{2,4}'?s$|^\d{4}$|seen live|favou?rite|albums? i own|listeners|check out|^my |^i |under \d/;
+const GENRE_SYN = { 'hip hop': 'hip-hop', hiphop: 'hip-hop', rnb: 'r&b', 'rhythm and blues': 'r&b', lofi: 'lo-fi', 'lo fi': 'lo-fi', 'synth pop': 'synthpop', 'synth-pop': 'synthpop', electronica: 'electronic', kpop: 'k-pop', jpop: 'j-pop' };
+const canonGenre = g => GENRE_SYN[g] || g;
+const prettyGenre = g => g.replace(/(^|[\s\-/&])([a-z])/g, (m, a, b) => a + b.toUpperCase()).replace(/\bR&b\b/g, 'R&B').replace(/\bEdm\b/g, 'EDM').replace(/\bUk\b/g, 'UK').replace(/\bIdm\b/g, 'IDM').replace(/\bDnb\b/g, 'DnB');
+function pickGenres(tags) {
+  const out = [];
+  for (const t of tags) {
+    const n = String(t?.name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    if (!n || n.length > 32 || (t.count != null && +t.count < 5)) continue;
+    if (NOT_GENRE.has(n) || BAD_TAG.test(n)) continue;
+    const c = canonGenre(n);
+    if (!out.includes(c)) out.push(c);
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+const artistKey = a => normName(a || '');
+function genreOf(e) {
+  if (e.kind === 'episode') return 'Podcast';
+  const g = D.genres[artistKey(e.artists[0])];
+  return g && g.g ? g.g : null;
+}
+async function ensureGenres(entries, mkProgress) {
+  const todo = new Map();
+  for (const e of entries) {
+    if (e.kind !== 'track' && e.kind !== 'local') continue;
+    const a = e.artists[0]; if (!a) continue;
+    const k = artistKey(a);
+    if (k && D.genres[k] === undefined && !todo.has(k)) todo.set(k, a);
+  }
+  if (!todo.size) return;
+  const p = mkProgress(todo.size);
+  let n = 0;
+  for (const [k, a] of todo) {
+    if (p.cancelled) break;
+    const j = await lastfm({ method: 'artist.gettoptags', artist: a, autocorrect: 1 });
+    if (j?.toptags) { const t = pickGenres([].concat(j.toptags.tag || [])); D.genres[k] = { g: t[0] ? prettyGenre(t[0]) : null, t }; }
+    else if (j?.error === 6) D.genres[k] = { g: null, t: [] };
+    p.step();
+    if (++n % 25 === 0) saveData('genres');
+  }
+  await saveData('genres');
+}
+
+/* ReccoBeats (BPM, energy, mood) */
+let lastRecco = 0;
+async function reccoGet(ids) {
+  if (S.mode === 'demo') { await sleep(4); return Demo.recco(ids); }
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const gap = 160 - (Date.now() - lastRecco); if (gap > 0) await sleep(gap);
+    lastRecco = Date.now();
+    let r;
+    try { r = await fetch(`https://api.reccobeats.com/v1/audio-features?ids=${ids.join(',')}`, { headers: { Accept: 'application/json' } }); }
+    catch {
+      if (attempt < 1) { await sleep(1500); continue; }
+      throw new SourceError('Couldn\'t reach ReccoBeats, where BPM, energy and mood come from. Try again later.');
+    }
+    if (r.status === 429) { await sleep(Math.min(60, Number(r.headers.get('Retry-After')) || 3 * (attempt + 1)) * 1000); continue; }
+    if (r.status >= 500) { await sleep(2000); continue; }
+    return { status: r.status, json: r.ok ? await r.json().catch(() => null) : null };
+  }
+  throw new SourceError('ReccoBeats is busy right now. Try again in a few minutes.');
+}
+const pickF = it => it && typeof it.tempo === 'number' ? { bpm: Math.round(it.tempo), en: +it.energy, va: +it.valence, da: +it.danceability } : null;
+async function featBatch(ids) {
+  const r = await reccoGet(ids);
+  if (r.status === 400 && ids.length > 1) { const h = Math.ceil(ids.length / 2); return { ...(await featBatch(ids.slice(0, h))), ...(await featBatch(ids.slice(h))) }; }
+  const items = r.json?.content || [];
+  const out = {}, loose = [];
+  for (const it of items) { const m = /track\/([A-Za-z0-9]{22})/.exec(it?.href || ''); if (m) out[m[1]] = pickF(it); else loose.push(it); }
+  if (loose.length) {
+    if (ids.length === 1) out[ids[0]] = pickF(loose[0]);
+    else if (items.length === ids.length && !Object.keys(out).length) ids.forEach((id, i) => { out[id] = pickF(items[i]); });
+    else for (const id of ids.filter(i => !(i in out))) Object.assign(out, await featBatch([id]));
+  }
+  for (const id of ids) if (!(id in out)) out[id] = null;
+  return out;
+}
+const feat = e => (e.id && D.feats[e.id]) || null;
+async function ensureFeatures(entries, mkProgress) {
+  const ids = [...new Set(entries.filter(e => e.kind === 'track' && e.id && D.feats[e.id] === undefined).map(e => e.id))];
+  if (!ids.length) return;
+  const parts = chunk(ids, 40);
+  const p = mkProgress(parts.length);
+  let n = 0;
+  for (const b of parts) {
+    if (p.cancelled) break;
+    const got = await featBatch(b);
+    for (const [id, f] of Object.entries(got)) D.feats[id] = f || 0;
+    p.step();
+    if (++n % 10 === 0) saveData('feats');
+  }
+  await saveData('feats');
+}
+const moodWord = v => v < 0.35 ? 'moody' : v < 0.65 ? 'mellow' : 'upbeat';
+const energyWord = v => v < 0.35 ? 'calm' : v < 0.65 ? 'steady' : 'intense';
+
+/* Listening history: Spotify data download + Last.fm scrobbles + Spotify recent plays */
+const histKey = (title, artist) => normName(title) + '|' + normName(artist);
+const newAgg = () => ({ byName: {}, byUri: {} });
+function addPlay(agg, k, uri, ms, ts, timed) {
+  const bump = (map, key) => {
+    const r = map[key] || (map[key] = [0, 0, 0, 0]); // plays, ms played, plays without a duration, last played
+    if (timed) { r[1] += ms; if (ms >= 30000) { r[0]++; if (ts > r[3]) r[3] = ts; } }
+    else { r[0]++; r[2]++; if (ts > r[3]) r[3] = ts; }
+  };
+  bump(agg.byName, k);
+  if (uri && agg.byUri) bump(agg.byUri, uri);
+}
+function buildHistory(arrays) {
+  const ext = newAgg(), basic = newAgg();
+  const st = { ext: { n: 0, from: Infinity, to: 0 }, basic: { n: 0, from: Infinity, to: 0 } };
+  for (const arr of arrays) for (const x of arr) {
+    if (!x || typeof x !== 'object') continue;
+    let title, artist, uri = null, ms, ts, which;
+    if ('ts' in x && 'ms_played' in x) { title = x.master_metadata_track_name; artist = x.master_metadata_album_artist_name; uri = x.spotify_track_uri || null; ms = +x.ms_played || 0; ts = Date.parse(x.ts); which = 'ext'; }
+    else if ('endTime' in x && 'msPlayed' in x) { title = x.trackName; artist = x.artistName; ms = +x.msPlayed || 0; ts = Date.parse(String(x.endTime).replace(' ', 'T') + 'Z'); which = 'basic'; }
+    else continue;
+    if (!title || !artist || !ts) continue;
+    addPlay(which === 'ext' ? ext : basic, histKey(title, artist), uri, ms, ts, true);
+    const s = st[which]; s.n++; if (ts < s.from) s.from = ts; if (ts > s.to) s.to = ts;
+  }
+  const pick = st.ext.n ? ['extended', ext, st.ext] : st.basic.n ? ['basic', basic, st.basic] : null;
+  if (!pick) return null;
+  return { exp: { kind: pick[0], byName: pick[1].byName, byUri: pick[1].byUri, n: pick[2].n, from: pick[2].from, to: pick[2].to }, lfm: null, rec: null };
+}
+const hasHistory = () => !!(D.hist && (D.hist.exp || D.hist.lfm));
+function stats(e) {
+  const H = D.hist;
+  const out = { p: 0, ms: 0, last: 0 };
+  if (!H || !e.name || e.kind === 'gone') return out;
+  const k = histKey(e.name, e.artists[0] || '');
+  let u = 0;
+  const add = r => { if (!r) return; out.p += r[0]; out.ms += r[1]; u += r[2]; if (r[3] > out.last) out.last = r[3]; };
+  if (H.exp) add(H.exp.byName[k] || (e.uri && H.exp.byUri[e.uri]));
+  if (H.lfm) add(H.lfm.byName[k]);
+  else if (H.rec) add(H.rec.byName[k] || (e.uri && H.rec.byUri[e.uri]));
+  out.ms += u * (e.dur || 0);
+  return out;
+}
+function histSummary(agg) { let plays = 0, songs = 0; for (const r of Object.values(agg?.byName || {})) { if (r[0]) { plays += r[0]; songs++; } } return { plays, songs }; }
+let jszipP = null;
+function loadJSZip() {
+  if (window.JSZip) return Promise.resolve(window.JSZip);
+  return jszipP || (jszipP = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+    s.onload = () => res(window.JSZip);
+    s.onerror = () => { jszipP = null; s.remove(); rej(new Error('Couldn\'t load the ZIP reader. Unzip the file and upload the Streaming_History JSON files inside it instead.')); };
+    document.head.appendChild(s);
+  }));
+}
+async function importHistory(files, p) {
+  const arrays = [];
+  const base = n => n.split('/').pop();
+  for (const f of files) {
+    if (/\.zip$/i.test(f.name) || /zip/.test(f.type)) {
+      p.label(`Opening ${f.name}`);
+      const JSZip = await loadJSZip();
+      let z;
+      try { z = await JSZip.loadAsync(f); } catch { throw new Error(`Couldn't open ${f.name}. Make sure it's the ZIP file Spotify sent you.`); }
+      const names = Object.keys(z.files).filter(n => /\.json$/i.test(n) && /(streaming_?history|endsong)/i.test(base(n)) && !/video|podcast/i.test(base(n)));
+      for (const [i, n] of names.entries()) {
+        p.set(i, names.length, `Reading ${base(n)}`);
+        try { const a = JSON.parse(await z.file(n).async('string')); if (Array.isArray(a)) arrays.push(a); } catch {}
+      }
+    } else {
+      p.label(`Reading ${f.name}`);
+      try { const a = JSON.parse(await f.text()); if (Array.isArray(a)) arrays.push(a); } catch {}
+    }
+  }
+  const h = buildHistory(arrays);
+  if (!h) throw new Error('Couldn\'t find listening history in that. Upload the ZIP file from Spotify, or the Streaming_History JSON files inside it.');
+  D.hist = h;
+  await saveData('hist');
+  return h;
+}
+async function syncLastfm(p) {
+  const user = store.get('lfmUser');
+  if (!user) return 0;
+  const H = D.hist || (D.hist = { exp: null, lfm: null, rec: null });
+  const prev = H.lfm && H.lfm.user.toLowerCase() === user.toLowerCase() ? H.lfm : { user, to: 0, byName: {} };
+  const from = Math.max(prev.to, H.exp ? H.exp.to : 0);
+  const fresh = { byName: {} };
+  let page = 1, pages = 1, newest = prev.to, added = 0;
+  do {
+    const j = await lastfm({ method: 'user.getrecenttracks', user, limit: 200, page, ...(from ? { from: Math.floor(from / 1000) + 1 } : {}) });
+    if (j?.error === 6) throw new SourceError(`Last.fm couldn't find the user “${user}”. Check the username.`);
+    if (j?.error === 17) throw new SourceError(`“${user}” keeps their Last.fm listening private. Turn off “Hide recent listening” in Last.fm's privacy settings.`);
+    const rt = j?.recenttracks;
+    if (!rt) throw new SourceError('Last.fm sent back something unexpected. Try again later.');
+    pages = +rt['@attr']?.totalPages || 1;
+    for (const t of [].concat(rt.track || [])) {
+      if (t['@attr']?.nowplaying) continue;
+      const ts = (+t.date?.uts || 0) * 1000;
+      const artist = t.artist?.['#text'] || t.artist?.name || '';
+      if (!ts || !t.name || !artist || ts <= from) continue;
+      addPlay(fresh, histKey(t.name, artist), null, 0, ts, false);
+      added++; if (ts > newest) newest = ts;
+    }
+    p?.set(page, pages, `Reading your Last.fm plays`);
+    page++;
+  } while (page <= pages && !p?.cancelled);
+  if (p?.cancelled) return null;
+  for (const [k, r] of Object.entries(fresh.byName)) {
+    const o = prev.byName[k] || (prev.byName[k] = [0, 0, 0, 0]);
+    o[0] += r[0]; o[2] += r[2]; if (r[3] > o[3]) o[3] = r[3];
+  }
+  prev.user = user; prev.to = newest;
+  H.lfm = prev; H.rec = null;
+  S.lfmAt = Date.now();
+  await saveData('hist');
+  return added;
+}
+async function syncRecent() {
+  if (!D.hist?.exp || D.hist.lfm || store.get('lfmUser') || !hasScope('user-read-recently-played')) return;
+  if (Date.now() - (S.recentAt || 0) < 120000) return;
+  S.recentAt = Date.now();
+  const H = D.hist;
+  const j = await api('GET', '/me/player/recently-played', { query: { limit: 50 } });
+  const rec = H.rec || { to: 0, byName: {}, byUri: {} };
+  const cutoff = Math.max(rec.to, H.exp.to);
+  let newest = rec.to;
+  for (const it of j?.items || []) {
+    const t = it.track || it.item; const ts = Date.parse(it.played_at);
+    if (!t?.name || !ts || ts <= cutoff) continue;
+    addPlay(rec, histKey(t.name, t.artists?.[0]?.name || ''), t.uri, 0, ts, false);
+    if (ts > newest) newest = ts;
+  }
+  rec.to = newest; H.rec = rec;
+  await saveData('hist');
+}
+function fmtPlayed(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 1) return ms > 0 ? 'under 1 min' : '0 min';
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  return h < 48 ? `${h} hr ${m % 60} min` : `${h.toLocaleString()} hr`;
+}
+function agoLong(ts) {
+  if (!ts) return 'never';
+  const d = (Date.now() - ts) / 864e5;
+  if (d < 1) return 'today';
+  if (d < 2) return 'yesterday';
+  if (d < 14) return `${Math.floor(d)} days ago`;
+  if (d < 60) return `${Math.floor(d / 7)} weeks ago`;
+  if (d < 730) return `${Math.floor(d / 30.44)} months ago`;
+  return `${Math.floor(d / 365.25)} years ago`;
+}
+const fmtMonth = ts => new Date(ts).toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+function statMeta(e, which) {
+  const s = stats(e);
+  const parts = [[ 'p', plural(s.p, 'play') ], [ 'ms', `${fmtPlayed(s.ms)} listened` ], [ 'last', s.last ? `last played ${agoLong(s.last)}` : 'never played' ]];
+  parts.sort((a, b) => (b[0] === which) - (a[0] === which));
+  return parts.map(([k, t]) => k === which ? `<b>${esc(t.charAt(0).toUpperCase() + t.slice(1))}</b>` : t);
+}
+async function ensureData(need, entries) {
+  if (need === 'history') {
+    if (!hasHistory()) { openData('sec-history'); toast('Add your listening history first. It\'s one upload from Spotify.', 'warn'); return false; }
+    if (store.get('lfmUser') && Date.now() - (S.lfmAt || 0) > 600000) {
+      const p = progress('Checking Last.fm for new plays', 0, { cancellable: true });
+      await syncLastfm(p);
+      closeProgress();
+    } else await syncRecent().catch(() => {});
+    return true;
+  }
+  if (need === 'genre') {
+    if (S.mode === 'live' && !lfmKey()) { openData('sec-genres'); toast('Genres come from Last.fm. Add a free Last.fm API key first.', 'warn'); return false; }
+    await ensureGenres(entries, n => { const p = progress('Looking up genres', n, { cancellable: true }); p.label(`Asking Last.fm about ${plural(n, 'artist')}`); return p; });
+    return true;
+  }
+  if (need === 'features') {
+    await ensureFeatures(entries, n => { const p = progress('Getting BPM, energy and mood', n, { cancellable: true }); p.label('Asking ReccoBeats'); return p; });
+    return true;
+  }
+  return true;
+}
+
 /* ---------------- sorting ---------------- */
 const cmpStr = (a, b) => (a || '').localeCompare(b || '');
 const tie = (a, b) => collator.compare(a.album, b.album) || a.disc - b.disc || a.trackNo - b.trackNo;
@@ -544,6 +909,13 @@ const SORTS = {
   released: { label: 'Released', cmp: (a, b) => cmpStr(a.release, b.release) || tie(a, b), meta: e => [`<b>${esc(e.release || 'No date')}</b>`, e.artist], html: true },
   added: { label: 'Date added', cmp: (a, b) => cmpStr(a.addedAt, b.addedAt), defDir: -1, meta: e => [`<b>Added ${esc(fmtDate(e.addedAt))}</b>`, e.artist], html: true },
   length: { label: 'Length', cmp: (a, b) => a.dur - b.dur, meta: e => [e.artist, e.album] },
+  plays: { label: 'Plays', need: 'history', defDir: -1, val: e => stats(e).p, meta: e => statMeta(e, 'p'), html: true },
+  played: { label: 'Time played', need: 'history', defDir: -1, val: e => stats(e).ms, meta: e => statMeta(e, 'ms'), html: true },
+  last: { label: 'Last played', need: 'history', defDir: -1, val: e => stats(e).last || null, meta: e => statMeta(e, 'last'), html: true },
+  genre: { label: 'Genre', need: 'genre', val: e => genreOf(e), meta: e => [genreOf(e) ? `<b>${esc(genreOf(e))}</b>` : 'No genre found', e.artist], html: true },
+  bpm: { label: 'BPM', need: 'features', val: e => feat(e)?.bpm ?? null, meta: e => [feat(e) ? `<b>${feat(e).bpm} BPM</b>` : 'No BPM data', e.artist], html: true },
+  energy: { label: 'Energy', need: 'features', defDir: -1, val: e => feat(e)?.en ?? null, meta: e => [feat(e) ? `<b>Energy ${Math.round(feat(e).en * 100)} · ${energyWord(feat(e).en)}</b>` : 'No energy data', e.artist], html: true },
+  mood: { label: 'Mood', need: 'features', defDir: -1, val: e => feat(e)?.va ?? null, meta: e => [feat(e) ? `<b>Mood ${Math.round(feat(e).va * 100)} · ${moodWord(feat(e).va)}</b>` : 'No mood data', e.artist], html: true },
   shuffle: { label: 'Shuffle', meta: e => [e.artist, e.album] }
 };
 function spreadShuffle(list) {
@@ -563,6 +935,14 @@ function applySort(v) {
   let out;
   if (v.sortKey === 'orig') { out = base; if (v.sortDir < 0) out.reverse(); }
   else if (v.sortKey === 'shuffle') out = spreadShuffle(base);
+  else if (SORTS[v.sortKey].val) {
+    const val = SORTS[v.sortKey].val;
+    const pairs = base.map(e => [e, e.kind === 'gone' ? null : val(e)]);
+    const known = pairs.filter(x => x[1] != null && x[1] !== '');
+    const unknown = pairs.filter(x => x[1] == null || x[1] === '').map(x => x[0]);
+    known.sort((a, b) => v.sortDir * (typeof a[1] === 'string' ? collator.compare(a[1], b[1]) : a[1] - b[1]) || collator.compare(stripThe(a[0].artists[0]), stripThe(b[0].artists[0])) || cmpStr(a[0].release, b[0].release) || tie(a[0], b[0]) || a[0].pos - b[0].pos);
+    out = known.map(x => x[0]).concat(unknown);
+  }
   else {
     const c = SORTS[v.sortKey].cmp;
     out = base.sort((a, b) => (a.kind === 'gone') - (b.kind === 'gone') || v.sortDir * c(a, b) || a.pos - b.pos);
@@ -577,7 +957,7 @@ function visibleEntries(v) {
   const f = fold(v.filter).trim();
   if (!f) return list;
   const words = f.split(/\s+/);
-  return list.filter(e => { const hay = fold(`${e.name} ${e.artist} ${e.album}`); return words.every(w => hay.includes(w)); });
+  return list.filter(e => { const hay = fold(`${e.name} ${e.artist} ${e.album} ${genreOf(e) || ''}`); return words.every(w => hay.includes(w)); });
 }
 
 /* ---------------- UI primitives ---------------- */
@@ -603,10 +983,11 @@ function friendly(e) {
 async function run(fn) {
   if (S.busy) return;
   S.busy = true;
-  try { await fn(); }
+  try { return await fn(); }
   catch (e) {
     console.error(e);
     if (e instanceof AuthError) { toSetup(e.message); }
+    else if (e instanceof SourceError) toast(e.message, 'error');
     else toast(friendly(e), 'error');
   } finally { S.busy = false; closeProgress(); }
 }
@@ -696,7 +1077,74 @@ const app = $('#app');
 function render() {
   if (!S.mode) return renderSetup();
   if (S.view.name === 'list') return renderList();
+  if (S.view.name === 'data') return renderData();
   return renderHome();
+}
+
+function renderData() {
+  const demo = S.mode === 'demo', H = D.hist;
+  const ex = H?.exp ? histSummary(H.exp) : null;
+  const lf = H?.lfm ? histSummary(H.lfm) : null;
+  const rc = H?.rec ? histSummary(H.rec) : null;
+  const gVals = Object.values(D.genres), fVals = Object.values(D.feats);
+  const gKnown = gVals.filter(g => g.g).length, fKnown = fVals.filter(Boolean).length;
+  const needRelogin = S.mode === 'live' && H?.exp && !store.get('lfmUser') && !hasScope('user-read-recently-played');
+  app.innerHTML = `
+  <header class="top"><button class="back" data-act="home">${icon.back}Playlists</button></header>
+  <section class="list-head">
+    <h1>Data sources</h1>
+    <p class="note">Spotify doesn't share play counts, genres or BPM with apps like Crate anymore, so these come from other places. Everything stays saved in this browser on this device.</p>
+  </section>
+
+  <section class="card" id="sec-history" aria-labelledby="h-hist">
+    <h2 id="h-hist">Plays, time played and last played</h2>
+    <p class="status"><span class="led ${ex ? 'on' : ''}"></span>${ex ? `${plural(ex.plays, 'play')} of ${plural(ex.songs, 'song')} · ${esc(fmtMonth(H.exp.from))} to ${esc(fmtMonth(H.exp.to))}${demo ? ' (sample)' : ''}` : 'No listening history yet'}
+      ${lf ? `<small>Plus ${plural(lf.plays, 'play')} from Last.fm (${esc(H.lfm.user)}) since then</small>` : ''}
+      ${!lf && rc && rc.plays ? `<small>Plus ${plural(rc.plays, 'recent play')} from Spotify since then</small>` : ''}</p>
+    <details ${ex ? '' : 'open'}><summary>How to get your history from Spotify</summary>
+      <ol class="steps">
+        <li>Open <a href="https://www.spotify.com/account/privacy/" target="_blank" rel="noopener">spotify.com/account/privacy</a>. On a phone, switch your browser to desktop site if the page looks cut off.</li>
+        <li>Under <b>Download your data</b>, tick <b>Extended streaming history</b>, tap <b>Request data</b>, and confirm the email Spotify sends.</li>
+        <li>When Spotify emails you the download (it can take up to 30 days, often a few), save the ZIP and upload it here.</li>
+      </ol>
+    </details>
+    <label class="btn primary filebtn">${ex ? 'Upload newer Spotify data' : 'Upload Spotify data'}<input type="file" id="hist-file" accept=".zip,.json,application/zip,application/json" multiple aria-label="Upload your Spotify data download"></label>
+    <div class="field"><label for="lfm-user">Last.fm username <span class="muted">(optional)</span></label>
+      <div class="inrow"><input type="text" id="lfm-user" autocomplete="off" spellcheck="false" placeholder="${demo ? 'Not used with sample music' : 'Your Last.fm username'}" value="${esc(store.get('lfmUser') || '')}" ${demo ? 'disabled' : ''}><button class="btn" data-act="lfm-user" ${demo ? 'disabled' : ''}>Save and sync</button></div></div>
+    <p class="fine">Your Spotify download stops on the day you requested it. If Last.fm records your Spotify listening (connect it at <a href="https://www.last.fm/settings/applications" target="_blank" rel="noopener">last.fm/settings/applications</a>), Crate adds the plays since then so your numbers stay current. Without Last.fm, Crate adds your most recent Spotify plays each time you open it.</p>
+    ${needRelogin ? `<p class="alert">To add your recent Spotify plays, Crate needs one more permission. <button class="link" data-act="relogin">Log in again</button></p>` : ''}
+    ${H ? '<div class="row-actions"><button class="btn small" data-act="clear-hist">Forget listening history</button></div>' : ''}
+  </section>
+
+  <section class="card" id="sec-genres" aria-labelledby="h-gen">
+    <h2 id="h-gen">Genre</h2>
+    <p class="status"><span class="led ${gVals.length ? 'on' : ''}"></span>${gVals.length ? `Genres found for ${gKnown.toLocaleString()} of ${plural(gVals.length, 'artist')} checked` : demo ? 'Sample music uses made-up genres' : (lfmKey() ? 'Ready. Tap Genre on any playlist.' : 'Needs a free Last.fm API key')}</p>
+    <p class="fine">Genres come from the tags Last.fm listeners give each artist, so every song gets its artist's main genre.</p>
+    ${demo ? '' : `<details ${lfmKey() ? '' : 'open'}><summary>How to get a Last.fm API key</summary>
+      <ol class="steps">
+        <li>Make a free account at <a href="https://www.last.fm/join" target="_blank" rel="noopener">last.fm</a> if you don't have one, then open <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">last.fm/api/account/create</a>.</li>
+        <li>Type any application name and description (for example “Crate”), leave the callback URL empty, and submit.</li>
+        <li>Copy the <b>API key</b> (not the shared secret) and paste it here.</li>
+      </ol></details>
+    <div class="field"><label for="lfm-key">Last.fm API key</label><div class="inrow"><input type="text" id="lfm-key" autocomplete="off" spellcheck="false" placeholder="32 letters and numbers" value="${esc(lfmKey() || '')}"><button class="btn" data-act="lfm-key">Save</button></div></div>
+    <p class="err" id="lfm-key-err"></p>`}
+    ${gVals.length ? '<div class="row-actions"><button class="btn small" data-act="clear-genres">Forget saved genres</button></div>' : ''}
+  </section>
+
+  <section class="card" id="sec-sound" aria-labelledby="h-snd">
+    <h2 id="h-snd">BPM, energy and mood</h2>
+    <p class="status"><span class="led on"></span>${fVals.length ? `Data for ${fKnown.toLocaleString()} of ${plural(fVals.length, 'song')} checked` : 'Ready. Nothing to set up.'}</p>
+    <p class="fine">Comes from ReccoBeats, a free music database. Mood runs from moody to upbeat, energy from calm to intense. Very new or little-known songs may not have data.</p>
+    ${fVals.length ? '<div class="row-actions"><button class="btn small" data-act="clear-feats">Forget saved BPM data</button></div>' : ''}
+  </section>`;
+  if (S.view.focus) { const el = document.getElementById(S.view.focus); S.view.focus = null; setTimeout(() => el?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 30); }
+}
+function openData(focus) {
+  closeSheet();
+  S.view = { name: 'data', focus };
+  if (!S.inFrame && history.state?.crate !== 'list') { try { history.pushState({ crate: 'list' }, ''); } catch {} }
+  render();
+  if (!focus) window.scrollTo(0, 0);
 }
 function brand() { return `<div class="brand"><span class="disc" aria-hidden="true"></span>Crate</div>`; }
 
@@ -752,6 +1200,7 @@ function renderHome() {
     <button class="tool" data-act="tool-unsorted"><b>Unsorted songs</b><span>Liked songs that aren't in any of your playlists</span></button>
     <button class="tool" data-act="tool-merge"><b>Merge</b><span>Combine playlists into a new one</span></button>
     <button class="tool" data-act="tool-scan"><b>Duplicate check</b><span>Scan all ${plural(readable, 'playlist')} you can edit</span></button>
+    <button class="tool data" data-act="open-data"><b>Data sources</b><span>${hasHistory() ? 'Listening history loaded · genres · BPM' : 'Add play counts, genres and BPM'}</span></button>
   </section>
   <section aria-labelledby="pl-h">
     <div class="section-h"><h2 id="pl-h">Playlists</h2><button class="link" data-act="reload-home">Reload</button></div>
@@ -855,7 +1304,7 @@ function renderBar() {
   bar.innerHTML = html ? `<div class="bar-in">${html}</div>` : '';
   bar.hidden = !html;
 }
-const DIRS = { title: ['A to Z', 'Z to A'], artist: ['A to Z', 'Z to A'], album: ['A to Z', 'Z to A'], released: ['oldest first', 'newest first'], added: ['oldest first', 'newest first'], length: ['shortest first', 'longest first'] };
+const DIRS = { title: ['A to Z', 'Z to A'], artist: ['A to Z', 'Z to A'], album: ['A to Z', 'Z to A'], released: ['oldest first', 'newest first'], added: ['oldest first', 'newest first'], length: ['shortest first', 'longest first'], plays: ['fewest first', 'most first'], played: ['least first', 'most first'], last: ['longest ago first', 'most recent first'], genre: ['A to Z', 'Z to A'], bpm: ['slowest first', 'fastest first'], energy: ['calmest first', 'most energetic first'], mood: ['moodiest first', 'happiest first'] };
 function sortLabel(v) {
   if (v.sortKey === 'orig') return v.sortDir < 0 ? 'Reversed' : 'Original order';
   if (v.sortKey === 'shuffle') return 'Shuffled, artists spread out';
@@ -864,7 +1313,7 @@ function sortLabel(v) {
 function sortWord(v) {
   if (v.sortKey === 'orig') return v.sortDir < 0 ? 'reversed' : 'copy';
   if (v.sortKey === 'shuffle') return 'shuffled';
-  return 'by ' + SORTS[v.sortKey].label.toLowerCase();
+  return 'by ' + (v.sortKey === 'bpm' ? 'BPM' : SORTS[v.sortKey].label.toLowerCase());
 }
 
 /* ---------------- navigation ---------------- */
@@ -911,6 +1360,7 @@ async function reloadView(keepSort) {
 function toSetup(msg) {
   closeSheet(); closeProgress();
   if (S.mode === 'live') store.del('token');
+  D.genres = {}; D.feats = {}; D.hist = null;
   Object.assign(S, { mode: null, me: null, playlists: [], likedTotal: null, liked: null, cache: new Map(), view: { name: 'home' }, homeError: null, setupError: msg || '' });
   render();
 }
@@ -919,6 +1369,8 @@ async function startApp() {
   S.view = { name: 'home' };
   render();
   S.homeError = null;
+  S.recentAt = 0; S.lfmAt = 0;
+  await loadData();
   try { await loadHome(true); }
   catch (e) {
     S.homeLoading = null;
@@ -927,6 +1379,7 @@ async function startApp() {
   }
   S.homeLoading = null;
   render();
+  syncRecent().catch(() => {});
 }
 function startDemo() { Demo.reset(); S.mode = 'demo'; S.setupError = ''; startApp(); }
 
@@ -957,14 +1410,57 @@ const actions = {
     if (!editable(pl)) { toast(`Spotify only lets apps open playlists you own or collaborate on. To organize “${pl.name}”, make your own copy of it in the Spotify app first.`, 'warn'); return; }
     openList({ type: 'playlist', id: pl.id });
   },
-  sort(b) {
+  async sort(b) {
     const v = S.view, k = b.dataset.key;
-    if (v.loading) return;
+    if (v.loading || S.busy) return;
+    const def = SORTS[k];
+    if (def.need && !(k === v.sortKey)) {
+      const ok = await run(() => ensureData(def.need, v.entries));
+      if (!ok || S.view !== v) return;
+    }
     if (k === v.sortKey && k !== 'shuffle') v.sortDir *= -1;
-    else { v.sortKey = k; v.sortDir = SORTS[k].defDir || 1; }
+    else { v.sortKey = k; v.sortDir = def.defDir || 1; }
     applySort(v);
     render();
+    if (def.need) document.querySelector(`.tab[data-key="${k}"]`)?.scrollIntoView({ inline: 'center', block: 'nearest' });
   },
+  'open-data': () => openData(),
+  async 'lfm-key'() {
+    const k = $('#lfm-key').value.trim();
+    if (k && !/^[0-9a-f]{32}$/i.test(k)) { $('#lfm-key-err').textContent = 'That doesn\'t look like a Last.fm API key. It\'s 32 letters and numbers.'; return; }
+    if (k) store.set('lfmKey', k); else store.del('lfmKey');
+    lfmJsonp = false;
+    if (!k) { render(); toast('Removed the Last.fm key.'); return; }
+    const ok = await run(async () => {
+      const j = await lastfm({ method: 'artist.gettoptags', artist: 'Radiohead' });
+      if (!j?.toptags && j?.error !== 6) throw new SourceError('Last.fm didn\'t accept that key. Check you copied the API key, not the shared secret.');
+      return true;
+    });
+    if (!ok) store.del('lfmKey');
+    render();
+    if (ok) toast('Saved. Tap Genre on any playlist to sort by genre.');
+  },
+  async 'lfm-user'() {
+    const u = $('#lfm-user').value.trim();
+    if (!u) { store.del('lfmUser'); if (D.hist) { D.hist.lfm = null; await saveData('hist'); } render(); toast('Stopped using Last.fm plays.'); return; }
+    if (!lfmKey()) { toast('Add your Last.fm API key in the Genre section first. Last.fm needs it for this too.', 'warn'); $('#lfm-key')?.focus(); return; }
+    store.set('lfmUser', u);
+    await run(async () => {
+      const p = progress('Reading your Last.fm plays', 0, { cancellable: true });
+      const n = await syncLastfm(p);
+      p.close();
+      render();
+      if (n === null) toast('Stopped. Nothing from Last.fm was added.', 'warn');
+      else toast(`Added ${plural(n, 'play')} from Last.fm${D.hist?.exp ? ' since your Spotify download' : ''}.`);
+    });
+  },
+  async 'clear-hist'() {
+    if (!(await confirmBox('Forget listening history?', 'Crate deletes the play counts it saved on this device. Your Spotify account isn\'t affected, and you can upload the file again any time.', 'Forget', true))) return;
+    D.hist = null; await kv.del(dkey('hist')); render(); toast('Listening history removed.');
+  },
+  async 'clear-genres'() { D.genres = {}; await kv.del(dkey('genres')); render(); toast('Saved genres removed.'); },
+  async 'clear-feats'() { D.feats = {}; await kv.del(dkey('feats')); render(); toast('Saved BPM, energy and mood removed.'); },
+  relogin() { store.del('token'); login(); },
   reset() { const v = S.view; v.sortKey = 'orig'; v.sortDir = 1; applySort(v); render(); },
   'toggle-select'() { const v = S.view; if (v.loading) return; v.selecting = !v.selecting; if (!v.selecting) v.sel.clear(); render(); },
   'sel-all'() { const v = S.view; visibleEntries(v).forEach(e => v.sel.add(e.uid)); renderRows(); renderBar(); },
@@ -1125,6 +1621,7 @@ function moreMenu() {
   const u = isPl ? store.get('undo.' + v.src.id) : null;
   const items = [];
   if (v.src.type !== 'unsorted') items.push(['dupes', 'Find duplicates', 'Repeats and different versions of the same song']);
+  items.push(['splitgenre', 'Split by genre', 'One new playlist per genre']);
   items.push(['split', 'Split into playlists', 'By decade, artist or the year you added them']);
   items.push(['saveas', 'Save as a new playlist', 'Uses the order and filter you see']);
   if (isPl && owned(pl)) items.push(['rename', 'Rename']);
@@ -1135,6 +1632,7 @@ function moreMenu() {
     .then(k => {
       if (k === 'dupes') dupesFlow();
       if (k === 'split') splitFlow();
+      if (k === 'splitgenre') (async () => { const v = S.view; const ok = await run(() => ensureData('genre', visibleEntries(v))); if (ok && S.view === v) splitFlow('genre'); })();
       if (k === 'saveas') saveAsNew();
       if (k === 'rename') renameFlow();
       if (k === 'undo') undoFlow();
@@ -1198,7 +1696,7 @@ async function dupesFlow() {
   });
 }
 
-async function splitFlow() {
+async function splitFlow(pre) {
   const v = S.view;
   const list = visibleEntries(v).filter(addable);
   if (!list.length) { toast('Nothing here to split.', 'warn'); return; }
@@ -1207,6 +1705,8 @@ async function splitFlow() {
     artist: { label: 'Artist', key: e => e.artists[0] || null, order: (a, b) => b[1].length - a[1].length || collator.compare(a[0], b[0]) },
     added: { label: 'Year added', key: e => e.addedAt ? `added ${e.addedAt.slice(0, 4)}` : null, order: (a, b) => b[0].localeCompare(a[0]) }
   };
+  if (pre === 'genre' || list.some(e => genreOf(e))) modes.genre = { label: 'Genre', key: e => genreOf(e), order: (a, b) => b[1].length - a[1].length || collator.compare(a[0], b[0]) };
+  const first = pre && modes[pre] ? pre : 'decade';
   const groupsFor = (mode, min) => {
     const m = new Map();
     for (const e of list) { const k = modes[mode].key(e); if (!k) continue; if (!m.has(k)) m.set(k, []); m.get(k).push(e); }
@@ -1215,8 +1715,9 @@ async function splitFlow() {
   let current = [];
   const paint = el => {
     const mode = el.querySelector('input[name="sm"]:checked').value;
-    const min = mode === 'artist' ? +el.querySelector('#smin').value : 1;
-    el.querySelector('#smin-wrap').hidden = mode !== 'artist';
+    const min = mode === 'artist' || mode === 'genre' ? +el.querySelector('#smin').value : 1;
+    el.querySelector('#smin-wrap').hidden = !(mode === 'artist' || mode === 'genre');
+    el.querySelector('#smin-label').textContent = mode === 'genre' ? 'Only genres with at least' : 'Only artists with at least';
     const prefix = el.querySelector('#spre').value;
     current = groupsFor(mode, min);
     el.querySelector('#sprev').innerHTML = current.length ? current.map(([k, a], i) => `<label class="check"><input type="checkbox" data-g="${i}" checked><span>${esc(prefix + k)}<small>${plural(a.length, 'song')}</small></span></label>`).join('') : '<p class="fine">No groups that size. Try a lower number.</p>';
@@ -1225,8 +1726,8 @@ async function splitFlow() {
   const countBtn = el => { const n = $$('input[data-g]:checked', el).length; const b = el.querySelector('[data-res="go"]'); b.textContent = `Create ${plural(n, 'playlist')}`; b.disabled = !n; };
   const pick = await ask(`<h2>Split into playlists</h2>
     <p>Makes new playlists from the ${plural(list.length, 'song')} shown in “${esc(v.title)}”. The original stays as it is.</p>
-    <div class="radios" role="radiogroup" aria-label="Group by">${Object.entries(modes).map(([k, m], i) => `<label><input type="radio" name="sm" value="${k}" ${i === 0 ? 'checked' : ''}>${m.label}</label>`).join('')}</div>
-    <div class="field" id="smin-wrap" hidden><label for="smin">Only artists with at least</label><select id="smin">${[2, 3, 5, 10].map(n => `<option value="${n}" ${n === 3 ? 'selected' : ''}>${n} songs</option>`).join('')}</select></div>
+    <div class="radios" role="radiogroup" aria-label="Group by">${Object.entries(modes).map(([k, m], i) => `<label><input type="radio" name="sm" value="${k}" ${k === first ? 'checked' : ''}>${m.label}</label>`).join('')}</div>
+    <div class="field" id="smin-wrap" hidden><label for="smin" id="smin-label">Only artists with at least</label><select id="smin">${[2, 3, 5, 10].map(n => `<option value="${n}" ${n === 3 ? 'selected' : ''}>${n} songs</option>`).join('')}</select></div>
     <div class="field"><label for="spre">Name starts with</label><input type="text" id="spre" maxlength="60" value="${esc(v.title)} – "></div>
     <p class="sub-h">Playlists to make</p>
     <div id="sprev"></div>
@@ -1391,6 +1892,20 @@ document.addEventListener('input', e => {
   if (e.target.id === 'cid') $('#cid-err').textContent = '';
 });
 document.addEventListener('change', e => {
+  if (e.target.id === 'hist-file' && e.target.files?.length) {
+    const files = [...e.target.files];
+    e.target.value = '';
+    run(async () => {
+      const p = progress('Reading your listening history');
+      const h = await importHistory(files, p);
+      if (store.get('lfmUser') && S.mode === 'live') { p.set(0, 0, 'Checking Last.fm for newer plays'); await syncLastfm(p).catch(() => {}); }
+      p.close();
+      render();
+      const s = histSummary(h.exp);
+      toast(`Loaded ${plural(s.plays, 'play')} of ${plural(s.songs, 'song')}${h.exp.kind === 'basic' ? ' from the past year' : ''}. Tap Plays, Time played or Last played on any playlist.`);
+    });
+    return;
+  }
   if (e.target.id === 'pl-sort') { S.home.sort = e.target.value; renderPlaylistRows(); }
   if (e.target.classList.contains('pick') && S.view.name === 'list') {
     const v = S.view, uid = e.target.dataset.uid;
@@ -1405,7 +1920,7 @@ document.addEventListener('keydown', e => {
 });
 window.addEventListener('popstate', () => {
   if (!$('#modal').hidden) closeSheet();
-  if (S.view.name === 'list' && !S.busy) goHome();
+  if ((S.view.name === 'list' || S.view.name === 'data') && !S.busy) goHome();
 });
 
 /* ---------------- demo backend (sample data, same rules as Spotify) ---------------- */
@@ -1504,6 +2019,10 @@ const Demo = (() => {
     };
     let m;
     if (method === 'GET' && p === '/me') return { ...ME };
+    if (method === 'GET' && p === '/me/player/recently-played') {
+      const ids = Object.keys(db.tracks).slice(0, 6);
+      return { items: ids.map((id, i) => ({ track: db.tracks[id], played_at: new Date(Date.now() - (i + 1) * 3600e3).toISOString() })), limit: 50 };
+    }
     if (method === 'GET' && p === '/me/playlists') return page(db.playlists.map(plObj));
     if (method === 'GET' && p === '/me/tracks') return page(db.liked.map(x => ({ added_at: x.added, track: trackFor(x.uri) })));
     if (method === 'POST' && p === '/me/playlists') {
@@ -1559,10 +2078,50 @@ const Demo = (() => {
     }
     throw new ApiError(404, `Sample data can't do ${method} ${p}`);
   }
-  return { handle, reset() { db = null; }, get db() { if (!db) build(); return db; } };
+  const TAGS = {
+    'Neon Harbor': ['synthpop', 'seen live', '80s', 'new wave'], 'Mara Quill': ['indie pop', 'female vocalists', 'dream pop'],
+    'The Velvet Lanterns': ['psychedelic rock', '60s', 'classic rock'], 'Kito & the Low Tide': ['surf rock', 'indie rock'],
+    'Jules Ferro': ['trip-hop', 'electronic', 'downtempo'], 'Static Orchard': ['indie rock', 'seen live', 'alternative'],
+    'Bea Calloway': ['soul', 'female vocalists', 'funk'], 'Northbound Echo': ['post-rock', 'instrumental'],
+    'Lucia Vey': ['bedroom pop', 'indie pop'], 'Copper Saints': ['grunge', '90s', 'alternative rock'],
+    'Dream Atlas': ['dream pop', 'shoegaze'], 'Otis Wren': ['funk', 'soul', '70s'], 'Paper Comets': ['pop punk', 'emo'],
+    'Sable Rivers': ['rnb', 'soul'], 'The Midnight Fold': ['synthwave', 'synthpop'], 'Grey Pilot': ['alternative rock', 'grunge'],
+    'Rosa Delgado': ['singer-songwriter', 'folk'], 'Hollow Pines': ['folk', 'indie folk'], 'DJ Marlowe': ['house', 'electronic', 'dance']
+  };
+  const h = s => { let x = 2166136261; for (const c of s) x = Math.imul(x ^ c.charCodeAt(0), 16777619); return x >>> 0; };
+  function lastfm(params) {
+    if (params.method === 'artist.gettoptags') {
+      const tags = TAGS[params.artist];
+      if (!tags) return { error: 6, message: 'The artist you supplied could not be found' };
+      return { toptags: { tag: tags.map((name, i) => ({ name, count: 100 - i * 20 })), '@attr': { artist: params.artist } } };
+    }
+    return { error: 3, message: 'Invalid Method' };
+  }
+  function recco(ids) {
+    if (!db) build();
+    return { status: 200, json: { content: ids.filter(id => h(id) % 11 !== 0).map(id => { const x = h(id); return { id: 'rb-' + id.slice(-8), href: 'https://open.spotify.com/track/' + id, tempo: 68 + (x % 112) + 0.4, energy: ((x >>> 8) % 100) / 100, valence: ((x >>> 16) % 100) / 100, danceability: ((x >>> 4) % 100) / 100, acousticness: 0.2 }; }) } };
+  }
+  function sampleHistory() {
+    if (!db) build();
+    const r = rng(99);
+    const out = [];
+    const T0 = Date.parse('2019-03-01'), T1 = Date.parse('2026-10-20');
+    const ids = Object.keys(db.tracks);
+    ids.forEach((id, i) => {
+      const t = db.tracks[id];
+      const plays = i % 7 === 0 ? 0 : Math.floor(r() ** 2.2 * 90);
+      for (let k = 0; k < plays; k++) {
+        const ms = r() < 0.15 ? Math.floor(r() * 25000) : Math.floor(t.duration_ms * (0.7 + r() * 0.3));
+        out.push({ ts: new Date(T0 + r() * (T1 - T0)).toISOString().replace(/\.\d+Z$/, 'Z'), platform: 'android', ms_played: ms, master_metadata_track_name: t.name, master_metadata_album_artist_name: t.artists[0].name, master_metadata_album_album_name: t.album.name, spotify_track_uri: t.uri, reason_end: 'trackdone', skipped: ms < 30000 });
+      }
+    });
+    out.push({ ts: '2024-02-02T10:00:00Z', ms_played: 1000, master_metadata_track_name: null, master_metadata_album_artist_name: null, spotify_track_uri: null, episode_name: 'Some podcast' });
+    return out;
+  }
+  return { handle, lastfm, recco, sampleHistory, reset() { db = null; }, get db() { if (!db) build(); return db; } };
 })();
 
-window.Crate = { S, Demo, planMoves, findDupes };
+window.Crate = { S, D, Demo, planMoves, findDupes, stats, genreOf, feat, buildHistory, pickGenres, prettyGenre };
 
 /* ---------------- boot ---------------- */
 (async function boot() {
