@@ -185,6 +185,15 @@ body.preview-paused .eq i{animation-play-state:paused}
 .player-note b{color:var(--ink)}
 .pbtn{width:44px;height:44px;border-radius:50%;border:1.5px solid var(--line);background:var(--surface);display:grid;place-items:center;cursor:pointer;flex:none}
 .pbtn svg{width:20px;height:20px}
+.art-btn{border:0;padding:0;cursor:pointer;position:relative;display:block}
+.art-play{position:absolute;inset:0;display:grid;place-items:center;background:rgb(0 0 0 / .38);color:#fff;border-radius:6px}
+.art-play svg{width:18px;height:18px}
+.art-play .eq i{background:#fff}
+.row.is-playing .art-play{background:rgb(0 0 0 / .6)}
+label.main,label.side{cursor:pointer}
+.pbtn.add{width:auto;border-radius:999px;padding:0 14px;gap:6px;display:flex;align-items:center;font-weight:650;font-size:14px;background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.pbtn.add svg{width:16px;height:16px}
+@media (max-width:420px){.pbtn.add span{display:none}.pbtn.add{width:44px;padding:0;justify-content:center}}
 body.has-player .bar{bottom:calc(100px + env(safe-area-inset-bottom))}
 body.has-player #app{padding-bottom:280px}
 
@@ -283,9 +292,12 @@ const icon = {
   more: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>',
   heart: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.8 4.5c2.1 0 3.6 1.2 5.2 3 1.6-1.8 3.1-3 5.2-3 3.8 0 5.9 3.9 4.4 7.3C19.5 16.4 12 21 12 21z"/></svg>',
   next: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5l9 7-9 7z" fill="currentColor"/><path d="M18 5v14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>',
-  close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>'
+  close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>',
+  play: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z" fill="currentColor"/></svg>',
+  add: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>'
 };
 
+const EQ = '<span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>';
 class ApiError extends Error { constructor(status, msg) { super(msg || `Spotify error ${status}`); this.status = status; } }
 class AuthError extends Error { constructor(msg) { super(msg || 'Log in to Spotify to continue.'); } }
 
@@ -1294,15 +1306,22 @@ function rowHtml(v, e, n) {
   const art = `<span class="art" style="--h:${hue(e.albumKey)}">${e.img ? `<img src="${esc(e.img)}" alt="" loading="lazy" onerror="this.remove()">` : ''}</span>`;
   const main = `<span class="main"><span class="title">${esc(e.name)}${tag}</span><span class="sub">${meta}</span></span><span class="side"><span class="yr">${esc(e.year)}</span><span>${e.dur ? fmtDur(e.dur) : ''}</span></span>`;
   const sel = v.sel.has(e.uid);
-  if (v.selecting) return `<li class="row${sel ? ' is-sel' : ''}${e.kind === 'gone' ? ' is-gone' : ''}" data-uid="${e.uid}"><label class="row-grid"><input type="checkbox" class="pick" data-uid="${e.uid}" ${sel ? 'checked' : ''} aria-label="Select ${esc(e.name)}">${art}${main}</label></li>`;
   const playing = P.uid === e.uid;
-  return `<li class="row${e.kind === 'gone' ? ' is-gone' : ''}${playing ? ' is-playing' : ''}" data-uid="${e.uid}"><button type="button" class="row-grid row-btn" data-act="preview" data-uid="${e.uid}" aria-label="Preview ${esc(e.name)}, ${esc(e.artist)}"><span class="num">${playing ? '<span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>' : n}</span>${art}${main}</button></li>`;
+  if (v.selecting) {
+    const ck = `ck-${e.uid}`;
+    const artBtn = previewable(e)
+      ? `<button type="button" class="art art-btn" style="--h:${hue(e.albumKey)}" data-act="preview" data-uid="${e.uid}" aria-label="Preview ${esc(e.name)}">${e.img ? `<img src="${esc(e.img)}" alt="" loading="lazy" onerror="this.remove()">` : ''}<span class="art-play" aria-hidden="true">${playing ? EQ : icon.play}</span></button>`
+      : art;
+    return `<li class="row${sel ? ' is-sel' : ''}${e.kind === 'gone' ? ' is-gone' : ''}${playing ? ' is-playing' : ''}" data-uid="${e.uid}"><div class="row-grid"><input type="checkbox" class="pick" id="${ck}" data-uid="${e.uid}" ${sel ? 'checked' : ''} aria-label="Select ${esc(e.name)}">${artBtn}<label class="main" for="${ck}"><span class="title">${esc(e.name)}${tag}</span><span class="sub">${meta}</span></label><label class="side" for="${ck}"><span class="yr">${esc(e.year)}</span><span>${e.dur ? fmtDur(e.dur) : ''}</span></label></div></li>`;
+  }
+  return `<li class="row${e.kind === 'gone' ? ' is-gone' : ''}${playing ? ' is-playing' : ''}" data-uid="${e.uid}"><button type="button" class="row-grid row-btn" data-act="preview" data-uid="${e.uid}" aria-label="Preview ${esc(e.name)}, ${esc(e.artist)}"><span class="num">${playing ? EQ : n}</span>${art}${main}</button></li>`;
 }
 function renderRows() {
   const v = S.view, rows = $('#rows');
   if (!rows) return;
   const st = $('#list-stats');
   if (v.loading) { rows.innerHTML = `<li class="empty">${esc(v.loading)}</li>`; if (st) st.textContent = ''; return; }
+  syncPreviewUid(v);
   const vis = visibleEntries(v);
   const total = v.entries.reduce((a, e) => a + e.dur, 0);
   if (st) st.textContent = `${plural(v.entries.length, 'song')} · ${fmtLong(total)}${v.filter.trim() ? ` · ${vis.length.toLocaleString()} shown` : ''}`;
@@ -1343,13 +1362,14 @@ function sortWord(v) {
 }
 
 /* ---------------- previews (Spotify's own embedded player) ---------------- */
-const P = { uid: null, ctrl: null, apiP: null, plain: false, want: false };
+const P = { uid: null, uri: null, idx: -1, ctrl: null, api: null, apiP: null, plain: false, want: false };
 const previewable = e => !!e && !e.isLocal && !!e.id && (e.kind === 'track' || e.kind === 'episode');
 function loadEmbedApi() {
+  if (P.api) return Promise.resolve(P.api);
   if (P.apiP) return P.apiP;
   P.apiP = new Promise((res, rej) => {
     const t = setTimeout(() => rej(new Error('timeout')), 8000);
-    window.onSpotifyIframeApiReady = api => { clearTimeout(t); res(api); };
+    window.onSpotifyIframeApiReady = api => { clearTimeout(t); P.api = api; res(api); };
     const s = document.createElement('script');
     s.src = 'https://open.spotify.com/embed/iframe-api/v1';
     s.async = true;
@@ -1361,22 +1381,31 @@ function loadEmbedApi() {
 }
 function playerShell(inner) {
   const el = $('#player');
-  el.innerHTML = `<div class="player-in">${inner}<button class="pbtn" data-act="preview-next" aria-label="Preview the next song">${icon.next}</button><button class="pbtn" data-act="preview-close" aria-label="Close the preview">${icon.close}</button></div>`;
+  el.innerHTML = `<div class="player-in">${inner}<button class="pbtn add" data-act="preview-add" aria-label="Add this song to a playlist">${icon.add}<span>Add</span></button><button class="pbtn" data-act="preview-next" aria-label="Preview the next song">${icon.next}</button><button class="pbtn" data-act="preview-close" aria-label="Close the preview">${icon.close}</button></div>`;
   el.hidden = false;
   document.body.classList.add('has-player');
 }
 function markPlaying() {
-  $$('#rows .row.is-playing').forEach(r => { r.classList.remove('is-playing'); const n = r.querySelector('.num'); const v = S.view; if (n && v.order) n.textContent = v.order.indexOf(r.dataset.uid) + 1; });
+  const v = S.view;
+  $$('#rows .row.is-playing').forEach(r => {
+    r.classList.remove('is-playing');
+    const n = r.querySelector('.num'); if (n && v.order) n.textContent = v.order.indexOf(r.dataset.uid) + 1;
+    const ap = r.querySelector('.art-play'); if (ap) ap.innerHTML = icon.play;
+  });
   if (!P.uid) return;
   const row = $(`#rows .row[data-uid="${P.uid}"]`);
-  if (row) { row.classList.add('is-playing'); const n = row.querySelector('.num'); if (n) n.innerHTML = '<span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>'; }
+  if (!row) return;
+  row.classList.add('is-playing');
+  const n = row.querySelector('.num'); if (n) n.innerHTML = EQ;
+  const ap = row.querySelector('.art-play'); if (ap) ap.innerHTML = EQ;
 }
 async function preview(uid) {
   const v = S.view;
   if (v.name !== 'list') return;
   const e = byUid(v).get(uid);
   if (!previewable(e)) { toast(e?.isLocal ? 'Spotify can\'t preview local files.' : 'Spotify doesn\'t have this one anymore.', 'warn'); return; }
-  P.uid = uid;
+  P.uid = uid; P.uri = e.uri;
+  P.idx = visibleEntries(v).findIndex(x => x.uid === uid);
   document.body.classList.remove('preview-paused');
   markPlaying();
   if (S.mode === 'demo') {
@@ -1410,15 +1439,38 @@ function previewNext() {
   if (v.name !== 'list') return;
   const vis = visibleEntries(v);
   const i = vis.findIndex(e => e.uid === P.uid);
-  const next = vis.slice(i + 1).find(previewable);
+  const next = (i >= 0 ? vis.slice(i + 1) : vis.slice(Math.max(0, P.idx))).find(previewable);
   if (!next) { toast('That was the last song in this list.'); return; }
   preview(next.uid);
   $(`#rows .row[data-uid="${next.uid}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
+async function previewAdd() {
+  const v = S.view;
+  if (v.name !== 'list' || !P.uid) return;
+  const e = byUid(v).get(P.uid) || v.entries.find(x => x.uri === P.uri);
+  if (!e) return;
+  if (!addable(e)) { toast('Spotify doesn\'t let apps add this one to playlists.', 'warn'); return; }
+  const t = await pickTarget(`Add “${e.name}” to…`, v.src.type === 'playlist' ? v.src.id : null);
+  if (!t) return;
+  await run(async () => {
+    const p = progress('Adding song');
+    const pl = t.newName ? await createPlaylist(t.newName) : plById(t.id);
+    const r = await addSongs(pl, [e], !!t.newName, p);
+    if (v.src.type === 'unsorted') { v.entries = v.entries.filter(x => x.uri !== e.uri); v.order = v.order.filter(u => byUid(v).has(u)); v.sel.delete(e.uid); renderRows(); renderBar(); }
+    toast(r.added ? `Added “${e.name}” to “${pl.name}”.` : `“${e.name}” is already in “${pl.name}”.`);
+  });
+}
+function syncPreviewUid(v) {
+  if (!P.uid || !v.entries) return;
+  const cur = byUid(v).get(P.uid);
+  if (cur && cur.uri === P.uri) return;
+  const f = v.entries.find(x => x.uri === P.uri);
+  P.uid = f ? f.uid : null;
+}
 function closePreview() {
   if (!P.uid && $('#player').hidden) return;
   try { P.ctrl?.destroy?.(); } catch {}
-  P.uid = null; P.ctrl = null; P.want = false;
+  P.uid = null; P.uri = null; P.idx = -1; P.ctrl = null; P.want = false;
   const el = $('#player'); el.hidden = true; el.innerHTML = '';
   document.body.classList.remove('has-player', 'preview-paused');
   markPlaying();
@@ -1538,6 +1590,7 @@ const actions = {
   preview: b => preview(b.dataset.uid),
   'preview-next': () => previewNext(),
   'preview-close': () => closePreview(),
+  'preview-add': () => previewAdd(),
   async 'lfm-key'() {
     const k = $('#lfm-key').value.trim();
     if (k && !/^[0-9a-f]{32}$/i.test(k)) { $('#lfm-key-err').textContent = 'That doesn\'t look like a Last.fm API key. It\'s 32 letters and numbers.'; return; }
