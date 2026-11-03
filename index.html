@@ -167,6 +167,27 @@ label.row-grid{cursor:pointer}
 .empty{padding:28px 4px;color:var(--muted);list-style:none}
 @media (max-width:400px){.row-grid{grid-template-columns:24px 40px minmax(0,1fr) auto;gap:10px}.art{width:40px;height:40px}}
 
+/* previews */
+.row-btn{width:100%;background:none;border:0;text-align:left;cursor:pointer;font:inherit;color:inherit;border-radius:0}
+.row-btn:hover .title{color:var(--accent)}
+.row.is-playing{background:var(--accent-soft)}
+.eq{display:inline-flex;gap:2px;align-items:flex-end;height:13px}
+.eq i{width:3px;height:4px;background:var(--accent);border-radius:1px;animation:eq .8s infinite ease-in-out alternate}
+.eq i:nth-child(2){animation-delay:.25s}.eq i:nth-child(3){animation-delay:.5s}
+body.preview-paused .eq i{animation-play-state:paused}
+@keyframes eq{from{height:3px}to{height:13px}}
+.player{position:fixed;left:0;right:0;bottom:0;z-index:22;background:var(--surface);border-top:1px solid var(--line);box-shadow:var(--shadow);padding:10px 12px calc(10px + env(safe-area-inset-bottom))}
+.player[hidden]{display:none}
+.player-in{max-width:780px;margin:0 auto;display:flex;gap:8px;align-items:center}
+.player-frame{flex:1;min-width:0;height:80px;border-radius:12px;overflow:hidden;background:var(--bg)}
+.player-frame iframe{width:100%;height:80px;border:0;display:block}
+.player-note{flex:1;min-width:0;font-size:14px;color:var(--muted);margin:0;padding:4px 6px;overflow-wrap:anywhere}
+.player-note b{color:var(--ink)}
+.pbtn{width:44px;height:44px;border-radius:50%;border:1.5px solid var(--line);background:var(--surface);display:grid;place-items:center;cursor:pointer;flex:none}
+.pbtn svg{width:20px;height:20px}
+body.has-player .bar{bottom:calc(100px + env(safe-area-inset-bottom))}
+body.has-player #app{padding-bottom:280px}
+
 /* bottom bar */
 .bar{position:fixed;left:0;right:0;bottom:0;z-index:20;background:var(--surface);border-top:1px solid var(--line);box-shadow:var(--shadow);padding:12px 16px calc(12px + env(safe-area-inset-bottom))}
 .bar[hidden]{display:none}
@@ -227,6 +248,7 @@ label.row-grid{cursor:pointer}
 </head>
 <body>
 <main id="app" aria-live="off"><p class="loading">Loading Crate…</p></main>
+<div id="player" class="player" hidden aria-label="Song preview"></div>
 <div id="modal" class="scrim" hidden></div>
 <div id="progress" class="scrim" hidden></div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
@@ -259,7 +281,9 @@ const stripThe = s => String(s || '').replace(/^the\s+/i, '');
 const icon = {
   back: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   more: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="2" fill="currentColor"/><circle cx="12" cy="12" r="2" fill="currentColor"/><circle cx="19" cy="12" r="2" fill="currentColor"/></svg>',
-  heart: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.8 4.5c2.1 0 3.6 1.2 5.2 3 1.6-1.8 3.1-3 5.2-3 3.8 0 5.9 3.9 4.4 7.3C19.5 16.4 12 21 12 21z"/></svg>'
+  heart: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.8 4.5c2.1 0 3.6 1.2 5.2 3 1.6-1.8 3.1-3 5.2-3 3.8 0 5.9 3.9 4.4 7.3C19.5 16.4 12 21 12 21z"/></svg>',
+  next: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5l9 7-9 7z" fill="currentColor"/><path d="M18 5v14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>',
+  close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>'
 };
 
 class ApiError extends Error { constructor(status, msg) { super(msg || `Spotify error ${status}`); this.status = status; } }
@@ -1141,6 +1165,7 @@ function renderData() {
 }
 function openData(focus) {
   closeSheet();
+  closePreview();
   S.view = { name: 'data', focus };
   if (!S.inFrame && history.state?.crate !== 'list') { try { history.pushState({ crate: 'list' }, ''); } catch {} }
   render();
@@ -1269,8 +1294,9 @@ function rowHtml(v, e, n) {
   const art = `<span class="art" style="--h:${hue(e.albumKey)}">${e.img ? `<img src="${esc(e.img)}" alt="" loading="lazy" onerror="this.remove()">` : ''}</span>`;
   const main = `<span class="main"><span class="title">${esc(e.name)}${tag}</span><span class="sub">${meta}</span></span><span class="side"><span class="yr">${esc(e.year)}</span><span>${e.dur ? fmtDur(e.dur) : ''}</span></span>`;
   const sel = v.sel.has(e.uid);
-  if (v.selecting) return `<li class="row${sel ? ' is-sel' : ''}${e.kind === 'gone' ? ' is-gone' : ''}"><label class="row-grid"><input type="checkbox" class="pick" data-uid="${e.uid}" ${sel ? 'checked' : ''} aria-label="Select ${esc(e.name)}">${art}${main}</label></li>`;
-  return `<li class="row${e.kind === 'gone' ? ' is-gone' : ''}"><div class="row-grid"><span class="num">${n}</span>${art}${main}</div></li>`;
+  if (v.selecting) return `<li class="row${sel ? ' is-sel' : ''}${e.kind === 'gone' ? ' is-gone' : ''}" data-uid="${e.uid}"><label class="row-grid"><input type="checkbox" class="pick" data-uid="${e.uid}" ${sel ? 'checked' : ''} aria-label="Select ${esc(e.name)}">${art}${main}</label></li>`;
+  const playing = P.uid === e.uid;
+  return `<li class="row${e.kind === 'gone' ? ' is-gone' : ''}${playing ? ' is-playing' : ''}" data-uid="${e.uid}"><button type="button" class="row-grid row-btn" data-act="preview" data-uid="${e.uid}" aria-label="Preview ${esc(e.name)}, ${esc(e.artist)}"><span class="num">${playing ? '<span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>' : n}</span>${art}${main}</button></li>`;
 }
 function renderRows() {
   const v = S.view, rows = $('#rows');
@@ -1316,14 +1342,98 @@ function sortWord(v) {
   return 'by ' + (v.sortKey === 'bpm' ? 'BPM' : SORTS[v.sortKey].label.toLowerCase());
 }
 
+/* ---------------- previews (Spotify's own embedded player) ---------------- */
+const P = { uid: null, ctrl: null, apiP: null, plain: false, want: false };
+const previewable = e => !!e && !e.isLocal && !!e.id && (e.kind === 'track' || e.kind === 'episode');
+function loadEmbedApi() {
+  if (P.apiP) return P.apiP;
+  P.apiP = new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error('timeout')), 8000);
+    window.onSpotifyIframeApiReady = api => { clearTimeout(t); res(api); };
+    const s = document.createElement('script');
+    s.src = 'https://open.spotify.com/embed/iframe-api/v1';
+    s.async = true;
+    s.onerror = () => { clearTimeout(t); rej(new Error('load failed')); };
+    document.head.appendChild(s);
+  });
+  P.apiP.catch(() => { P.apiP = null; });
+  return P.apiP;
+}
+function playerShell(inner) {
+  const el = $('#player');
+  el.innerHTML = `<div class="player-in">${inner}<button class="pbtn" data-act="preview-next" aria-label="Preview the next song">${icon.next}</button><button class="pbtn" data-act="preview-close" aria-label="Close the preview">${icon.close}</button></div>`;
+  el.hidden = false;
+  document.body.classList.add('has-player');
+}
+function markPlaying() {
+  $$('#rows .row.is-playing').forEach(r => { r.classList.remove('is-playing'); const n = r.querySelector('.num'); const v = S.view; if (n && v.order) n.textContent = v.order.indexOf(r.dataset.uid) + 1; });
+  if (!P.uid) return;
+  const row = $(`#rows .row[data-uid="${P.uid}"]`);
+  if (row) { row.classList.add('is-playing'); const n = row.querySelector('.num'); if (n) n.innerHTML = '<span class="eq" aria-hidden="true"><i></i><i></i><i></i></span>'; }
+}
+async function preview(uid) {
+  const v = S.view;
+  if (v.name !== 'list') return;
+  const e = byUid(v).get(uid);
+  if (!previewable(e)) { toast(e?.isLocal ? 'Spotify can\'t preview local files.' : 'Spotify doesn\'t have this one anymore.', 'warn'); return; }
+  P.uid = uid;
+  document.body.classList.remove('preview-paused');
+  markPlaying();
+  if (S.mode === 'demo') {
+    P.ctrl = null;
+    playerShell(`<p class="player-note"><b>${esc(e.name)}</b> · ${esc(e.artist)}<br>Sample songs don't play. With your Spotify connected, a short preview plays here.</p>`);
+    return;
+  }
+  const kind = e.kind === 'episode' ? 'episode' : 'track';
+  const uri = `spotify:${kind}:${e.id}`;
+  if (P.ctrl) { try { P.want = true; P.ctrl.loadUri(uri); P.ctrl.play(); return; } catch { P.ctrl = null; } }
+  playerShell(`<div class="player-frame" id="pf"><div id="pf-mount"></div></div>`);
+  if (!P.plain) {
+    try {
+      const api = await loadEmbedApi();
+      if (P.uid !== uid || !$('#pf-mount')) return;
+      P.want = true;
+      await new Promise(res => api.createController($('#pf-mount'), { uri, width: '100%', height: 80 }, c => {
+        P.ctrl = c;
+        c.addListener?.('ready', () => { if (P.want && P.ctrl === c) { P.want = false; c.play(); } });
+        c.addListener?.('playback_update', ev => document.body.classList.toggle('preview-paused', !!ev?.data?.isPaused));
+        res();
+      }));
+      return;
+    } catch { P.plain = true; }
+  }
+  const pf = $('#pf');
+  if (pf && P.uid === uid) pf.innerHTML = `<iframe title="Spotify preview of ${esc(e.name)}" src="https://open.spotify.com/embed/${kind}/${e.id}?utm_source=generator" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
+}
+function previewNext() {
+  const v = S.view;
+  if (v.name !== 'list') return;
+  const vis = visibleEntries(v);
+  const i = vis.findIndex(e => e.uid === P.uid);
+  const next = vis.slice(i + 1).find(previewable);
+  if (!next) { toast('That was the last song in this list.'); return; }
+  preview(next.uid);
+  $(`#rows .row[data-uid="${next.uid}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+function closePreview() {
+  if (!P.uid && $('#player').hidden) return;
+  try { P.ctrl?.destroy?.(); } catch {}
+  P.uid = null; P.ctrl = null; P.want = false;
+  const el = $('#player'); el.hidden = true; el.innerHTML = '';
+  document.body.classList.remove('has-player', 'preview-paused');
+  markPlaying();
+}
+
 /* ---------------- navigation ---------------- */
 function goHome(push = false) {
   closeSheet();
+  closePreview();
   S.view = { name: 'home' };
   render();
   window.scrollTo(0, 0);
 }
 async function openList(src, preset) {
+  closePreview();
   const pl = src.type === 'playlist' ? plById(src.id) : null;
   const v = {
     name: 'list', src, sortKey: 'orig', sortDir: 1, filter: '', selecting: false, sel: new Set(), entries: [], order: [],
@@ -1358,7 +1468,7 @@ async function reloadView(keepSort) {
   render();
 }
 function toSetup(msg) {
-  closeSheet(); closeProgress();
+  closeSheet(); closeProgress(); closePreview();
   if (S.mode === 'live') store.del('token');
   D.genres = {}; D.feats = {}; D.hist = null;
   Object.assign(S, { mode: null, me: null, playlists: [], likedTotal: null, liked: null, cache: new Map(), view: { name: 'home' }, homeError: null, setupError: msg || '' });
@@ -1425,6 +1535,9 @@ const actions = {
     if (def.need) document.querySelector(`.tab[data-key="${k}"]`)?.scrollIntoView({ inline: 'center', block: 'nearest' });
   },
   'open-data': () => openData(),
+  preview: b => preview(b.dataset.uid),
+  'preview-next': () => previewNext(),
+  'preview-close': () => closePreview(),
   async 'lfm-key'() {
     const k = $('#lfm-key').value.trim();
     if (k && !/^[0-9a-f]{32}$/i.test(k)) { $('#lfm-key-err').textContent = 'That doesn\'t look like a Last.fm API key. It\'s 32 letters and numbers.'; return; }
@@ -2121,7 +2234,7 @@ const Demo = (() => {
   return { handle, lastfm, recco, sampleHistory, reset() { db = null; }, get db() { if (!db) build(); return db; } };
 })();
 
-window.Crate = { S, D, Demo, planMoves, findDupes, stats, genreOf, feat, buildHistory, pickGenres, prettyGenre };
+window.Crate = { S, D, P, Demo, planMoves, findDupes, stats, genreOf, feat, buildHistory, pickGenres, prettyGenre };
 
 /* ---------------- boot ---------------- */
 (async function boot() {
