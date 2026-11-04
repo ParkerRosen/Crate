@@ -146,7 +146,20 @@ details[open] > summary{margin-bottom:8px}
 .tab:hover{color:var(--ink)}
 .tab[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);padding-top:15px}
 .tab .dir{font-size:13px}
-.list-tools{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:10px 0 8px}
+.list-tools{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;padding:10px 0 8px}
+.btn.ai{border-color:var(--accent);color:var(--accent)}
+.spark{color:var(--accent);font-weight:800}
+.tool.ai{grid-column:1/-1;border-color:var(--accent);background:linear-gradient(135deg,var(--accent-soft),var(--surface) 70%)}
+.ai-box{border:1.5px solid var(--accent);background:var(--accent-soft);border-radius:14px;padding:12px 14px;margin:4px 0 10px;display:grid;gap:6px}
+.ai-box p{margin:0}
+.ai-box .q{font-weight:650;overflow-wrap:anywhere}
+.ai-box .row-actions{margin-top:4px}
+textarea{background:var(--surface);border:1.5px solid var(--line);border-radius:12px;padding:10px 12px;width:100%;font:inherit;color:inherit;resize:vertical;min-height:84px}
+textarea:focus{outline:none;border-color:var(--accent)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0}
+.chip-btn{border:1.5px solid var(--line);background:var(--bg);border-radius:999px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer}
+.chip-btn:hover{border-color:var(--accent)}
+@media (max-width:400px){.btn.ai .long{display:none}}
 .rows{list-style:none;margin:0;padding:0}
 .row{border-bottom:1px solid var(--line);content-visibility:auto;contain-intrinsic-size:auto 66px}
 .row-grid{display:grid;grid-template-columns:30px 44px minmax(0,1fr) auto;gap:12px;align-items:center;padding:10px 2px;min-height:64px}
@@ -934,10 +947,162 @@ async function ensureData(need, entries) {
   return true;
 }
 
+/* AI song search (Claude) */
+const AI_MODEL = 'claude-haiku-5-5';
+const aiKey = () => store.get('aiKey') || '';
+const AI_SYSTEM = `You help someone find songs in their own music library that fit what they describe.
+You get their request and a numbered list of songs with data columns. Use what you know about each song and artist (genre, sound, instruments, vocals, tempo, mood, era, lyrical themes) together with the data. Energy, mood and danceability are 0-100; higher mood means happier. Empty columns mean the data is missing.
+Score every song from 0 to 10 for how well it fits the request: 10 = perfect fit, 7 = clearly fits, 4 = partly fits, 0 = not at all. If you don't recognise a song, judge from the artist, title and data, and don't go above 7.
+Reply with JSON only, no other text, in this shape: {"r":[[n,score,"reason"],...]} with one entry for every song. The reason is at most 8 words describing the song's sound or feel as it relates to the request.`;
+async function claudeCall(system, user, maxTokens) {
+  const key = aiKey();
+  if (!key) throw new SourceError('Add your Claude API key on the Data sources page first.');
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let r;
+    try {
+      r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+        body: JSON.stringify({ model: AI_MODEL, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] })
+      });
+    } catch {
+      if (attempt < 2) { await sleep(1500); continue; }
+      throw new SourceError('Couldn\'t reach Claude. Check your connection and try again.');
+    }
+    const j = await r.json().catch(() => null);
+    if (r.ok) return (j?.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+    const msg = j?.error?.message || '';
+    if (r.status === 401 || (r.status === 403 && /key|auth|permission/i.test(msg))) throw new SourceError('Claude didn\'t accept your API key. Check it on the Data sources page.');
+    if (/credit balance|billing|purchase credits/i.test(msg)) throw new SourceError('Your Claude API account is out of credit. Add some at platform.claude.com/settings/billing, then try again.');
+    if (r.status === 429 || r.status === 529 || r.status >= 500) { await sleep(Math.min(30, Number(r.headers.get('retry-after')) || 2 * (attempt + 1)) * 1000); continue; }
+    throw new SourceError(`Claude couldn't do that (${r.status}${msg ? ': ' + msg : ''}).`);
+  }
+  throw new SourceError('Claude is busy right now. Try again in a minute.');
+}
+const pct = x => Number.isFinite(x) ? Math.round(x * 100) : '';
+function songLine(e, n) {
+  const f = feat(e), g = D.genres[artistKey(e.artists[0])], st = hasHistory() ? stats(e) : null;
+  const cols = [n, e.name, e.artist, e.album, e.year || '', (g?.t || []).slice(0, 3).join(', ') || (e.kind === 'episode' ? 'podcast' : ''),
+    f ? f.bpm : '', f ? pct(f.en) : '', f ? pct(f.va) : '', f ? pct(f.da) : '',
+    st ? `${st.p} plays` : '', st ? (st.last ? `${Math.max(0, Math.round((Date.now() - st.last) / 2.63e9))} months ago` : 'never') : ''];
+  return cols.map(c => String(c).replace(/\|/g, '/').replace(/\s+/g, ' ').trim()).join(' | ');
+}
+async function aiScoreBatch(q, batch) {
+  if (S.mode === 'demo') { await sleep(40); return Demo.aiScore(q, batch); }
+  const user = `Request: ${q}\n\nSongs (n | title | artist | album | year | tags | BPM | energy | mood | danceability | plays | last played):\n` + batch.map((e, i) => songLine(e, i + 1)).join('\n');
+  const text = await claudeCall(AI_SYSTEM, user, Math.min(8000, 400 + batch.length * 30));
+  const out = new Map();
+  try {
+    const j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1));
+    for (const row of j.r || []) {
+      const [n, sc, why] = row || [];
+      const e = batch[n - 1];
+      if (e && Number.isFinite(+sc)) out.set(e.uri, { s: Math.max(0, Math.min(10, Math.round(+sc))), why: String(why || '').slice(0, 90) });
+    }
+  } catch {}
+  return out;
+}
+async function aiSearch(entries, q, p) {
+  const list = entries.filter(e => e.uri && e.kind !== 'gone');
+  const batches = chunk(list, 120);
+  p.set(0, batches.length, `Claude is checking ${plural(list.length, 'song')}`);
+  const res = new Map();
+  let next = 0, failed = null;
+  const worker = async () => {
+    while (next < batches.length && !p.cancelled && !failed) {
+      const b = batches[next++];
+      try {
+        const got = await aiScoreBatch(q, b);
+        const missing = b.filter(e => !got.has(e.uri));
+        if (missing.length > b.length * 0.3 && !p.cancelled) for (const [k, x] of await aiScoreBatch(q, missing)) got.set(k, x);
+        for (const [k, x] of got) res.set(k, x);
+        p.step();
+      } catch (e) { failed = e; }
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  if (failed && !res.size) throw failed;
+  if (failed) toast('Claude stopped partway, so some songs weren\'t scored.', 'warn');
+  return res;
+}
+const AI_EXAMPLES = ['Chill songs for a rainy night', 'Upbeat songs for the gym', 'Sad songs with female vocals', 'Feel-good 2000s throwbacks', 'Songs for a long night drive'];
+function aiPrompt(where) {
+  return ask(`<h2><span class="spark">✦</span> Ask AI</h2>
+    <p>Describe what you're in the mood for. Claude goes through every song ${where} and scores how well each one fits.</p>
+    <div class="field"><label for="ai-q">What are you looking for?</label><textarea id="ai-q" rows="3" maxlength="300" placeholder="e.g. mellow songs with acoustic guitar for a Sunday morning" autofocus>${esc(S.lastAiQ || '')}</textarea></div>
+    <div class="chips">${AI_EXAMPLES.map(x => `<button type="button" class="chip-btn" data-ex="${esc(x)}">${esc(x)}</button>`).join('')}</div>
+    <p class="err" id="ai-err"></p>
+    <div class="actions"><button class="btn" data-res="cancel">Cancel</button><button class="btn primary" data-res="go">Find songs</button></div>`,
+    el => { const q = el.querySelector('#ai-q').value.trim(); if (q.length < 3) { el.querySelector('#ai-err').textContent = 'Describe what you want first.'; return undefined; } return q; },
+    el => el.querySelector('.sheet').addEventListener('click', ev => { const b = ev.target.closest('[data-ex]'); if (b) { const t = el.querySelector('#ai-q'); t.value = b.dataset.ex; t.focus(); } }));
+}
+function needAiKey() {
+  if (S.mode === 'demo' || aiKey()) return false;
+  openData('sec-ai');
+  toast('Add a Claude API key first. It takes a couple of minutes.', 'warn');
+  return true;
+}
+async function doAiSearch(v, q) {
+  S.lastAiQ = q;
+  await run(async () => {
+    const p = progress('Asking AI', 0, { cancellable: true });
+    try { await ensureFeatures(v.entries, n => { p.set(0, n, 'Getting BPM, energy and mood first'); return p; }); } catch {}
+    if (S.mode === 'demo') await ensureGenres(v.entries, n => { p.set(0, n, 'Looking up genres'); return p; });
+    if (p.cancelled) return;
+    const res = await aiSearch(v.entries, q, p);
+    if (S.view !== v || p.cancelled && !res.size) return;
+    if (!res.size) throw new SourceError('Claude didn\'t send back any scores. Try again, or describe it a different way.');
+    v.ai = { q, res }; v.aiOnly = false; v.filter = ''; v.sortKey = 'match'; v.sortDir = -1;
+    applySort(v); render(); window.scrollTo(0, 0);
+    const strong = [...res.values()].filter(x => x.s >= 7).length;
+    toast(strong ? `Found ${plural(strong, 'strong match', 'strong matches')}.` : 'No strong matches. The closest songs are at the top.');
+  });
+}
+async function aiFlowList() {
+  const v = S.view;
+  if (v.loading || needAiKey()) return;
+  const q = await aiPrompt(`in “${esc(v.title)}” (${plural(v.entries.length, 'song')})`);
+  if (q && S.view === v) await doAiSearch(v, q);
+}
+async function aiFlowLibrary() {
+  if (needAiKey()) return;
+  const readable = S.playlists.filter(editable);
+  const q = await aiPrompt(`in your Liked Songs and ${plural(readable.length, 'playlist')}`);
+  if (!q) return;
+  const entries = await run(async () => {
+    const p = progress('Gathering your library', 0, { cancellable: true });
+    p.label('Loading Liked Songs');
+    const liked = await entriesFor({ type: 'liked' }, false, (d, t) => p.label(`Loading Liked Songs · ${d.toLocaleString()} of ${t.toLocaleString()}`));
+    const all = await loadAllReadable(p);
+    if (!all) return null;
+    const seen = new Set(), out = [];
+    for (const e of [...liked, ...all.flatMap(([, es]) => es)]) {
+      if (!e.uri || e.isLocal || e.kind === 'gone' || seen.has(e.uri)) continue;
+      seen.add(e.uri);
+      out.push({ ...e, uid: 'a' + out.length, pos: out.length });
+    }
+    return out;
+  });
+  if (!entries) return;
+  await openList({ type: 'ai' }, { entries, title: 'Your library', note: `${plural(entries.length, 'song')} from Liked Songs and ${plural(readable.length, 'playlist')}, each counted once.` });
+  await doAiSearch(S.view, q);
+}
+function renderAiBanner(v) {
+  const ab = $('#ai-banner');
+  if (!ab) return;
+  if (!v.ai) { ab.hidden = true; ab.innerHTML = ''; return; }
+  const strong = v.entries.filter(e => (v.ai.res.get(e.uri)?.s ?? -1) >= 7).length;
+  ab.hidden = false;
+  ab.innerHTML = `<div class="ai-box"><p class="q"><span class="spark">✦</span> “${esc(v.ai.q)}”</p><p class="muted">${plural(strong, 'strong match', 'strong matches')} (7 or more out of 10)</p>
+    <div class="row-actions"><button class="btn small" data-act="ai-only" aria-pressed="${!!v.aiOnly}">Only matches</button><button class="btn small primary" data-act="ai-save" ${strong ? '' : 'disabled'}>Save matches as playlist</button><button class="btn small ghost" data-act="ai-ask">New search</button><button class="btn small ghost" data-act="ai-clear">Clear</button></div></div>`;
+}
+
 /* ---------------- sorting ---------------- */
 const cmpStr = (a, b) => (a || '').localeCompare(b || '');
 const tie = (a, b) => collator.compare(a.album, b.album) || a.disc - b.disc || a.trackNo - b.trackNo;
+const aiOf = e => S.view.ai?.res.get(e.uri) || null;
 const SORTS = {
+  match: { label: '✦ AI match', defDir: -1, val: e => aiOf(e)?.s ?? null, meta: e => aiOf(e) ? [`<b>Match ${aiOf(e).s}/10</b>`, aiOf(e).why || e.artist] : ['Not scored', e.artist], html: true },
   orig: { label: 'Original', meta: e => [e.artist, e.album] },
   title: { label: 'Title', cmp: (a, b) => collator.compare(a.name, b.name) || collator.compare(a.artist, b.artist), meta: e => [e.artist, e.album] },
   artist: { label: 'Artist', cmp: (a, b) => collator.compare(stripThe(a.artists[0]), stripThe(b.artists[0])) || cmpStr(a.release, b.release) || tie(a, b), meta: e => [`<b>${esc(e.artist)}</b>`, e.album], html: true },
@@ -989,7 +1154,8 @@ const isDirty = v => v.order.length !== v.entries.length || v.order.some((u, i) 
 function byUid(v) { if (!v._map || v._mapFor !== v.entries) { v._map = new Map(v.entries.map(e => [e.uid, e])); v._mapFor = v.entries; } return v._map; }
 function visibleEntries(v) {
   const m = byUid(v);
-  const list = v.order.map(u => m.get(u)).filter(Boolean);
+  let list = v.order.map(u => m.get(u)).filter(Boolean);
+  if (v.aiOnly && v.ai) list = list.filter(e => (v.ai.res.get(e.uri)?.s ?? -1) >= 7);
   const f = fold(v.filter).trim();
   if (!f) return list;
   const words = f.split(/\s+/);
@@ -1132,6 +1298,21 @@ function renderData() {
     <p class="note">Spotify doesn't share play counts, genres or BPM with apps like Crate anymore, so these come from other places. Everything stays saved in this browser on this device.</p>
   </section>
 
+  <section class="card" id="sec-ai" aria-labelledby="h-ai">
+    <h2 id="h-ai"><span class="spark">✦</span> AI song search</h2>
+    <p class="status"><span class="led ${demo || aiKey() ? 'on' : ''}"></span>${demo ? 'Sample music uses made-up AI scores' : aiKey() ? `Ready · key ending ${esc(aiKey().slice(-4))}` : 'Needs a Claude API key'}</p>
+    <p class="fine">Claude doesn't listen to the audio. It judges each song from what it knows about it, plus the genre, BPM, energy and mood data. Searching 1,000 songs costs roughly 1 to 2 cents of Claude API credit.</p>
+    ${demo ? '' : `<details ${aiKey() ? '' : 'open'}><summary>How to get a Claude API key</summary>
+      <ol class="steps">
+        <li>Open <a href="https://platform.claude.com/" target="_blank" rel="noopener">platform.claude.com</a> and sign in or make an account. It's separate from the Claude app and billed separately.</li>
+        <li>Go to <a href="https://platform.claude.com/settings/billing" target="_blank" rel="noopener">Settings → Billing</a> and buy credits ($5 is the minimum and lasts a long time here).</li>
+        <li>Go to <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">Settings → API keys</a>, tap <b>Create key</b>, copy it, and paste it below. It's only saved in this browser.</li>
+      </ol></details>
+    <div class="field"><label for="ai-key">Claude API key</label><div class="inrow"><input type="password" id="ai-key" autocomplete="off" spellcheck="false" placeholder="${aiKey() ? 'Saved. Paste a new key to replace it' : 'sk-ant-…'}"><button class="btn" data-act="ai-key">Save</button></div></div>
+    <p class="err" id="ai-key-err"></p>
+    ${aiKey() ? '<div class="row-actions"><button class="btn small" data-act="ai-key-remove">Remove key</button></div>' : ''}`}
+  </section>
+
   <section class="card" id="sec-history" aria-labelledby="h-hist">
     <h2 id="h-hist">Plays, time played and last played</h2>
     <p class="status"><span class="led ${ex ? 'on' : ''}"></span>${ex ? `${plural(ex.plays, 'play')} of ${plural(ex.songs, 'song')} · ${esc(fmtMonth(H.exp.from))} to ${esc(fmtMonth(H.exp.to))}${demo ? ' (sample)' : ''}` : 'No listening history yet'}
@@ -1234,6 +1415,7 @@ function renderHome() {
     <p class="stats">${plural(S.playlists.length, 'playlist')} · ${plural(S.likedTotal || 0, 'liked song')}</p>
   </section>
   <section class="tools" aria-label="Tools">
+    <button class="tool ai" data-act="ai-library"><b><span class="spark">✦</span> Ask AI</b><span>Describe a vibe and Claude finds the songs in your library that fit</span></button>
     <button class="tool" data-act="tool-unsorted"><b>Unsorted songs</b><span>Liked songs that aren't in any of your playlists</span></button>
     <button class="tool" data-act="tool-merge"><b>Merge</b><span>Combine playlists into a new one</span></button>
     <button class="tool" data-act="tool-scan"><b>Duplicate check</b><span>Scan all ${plural(readable, 'playlist')} you can edit</span></button>
@@ -1268,7 +1450,7 @@ function renderPlaylistRows() {
 
 function renderList() {
   const v = S.view;
-  const tabs = Object.entries(SORTS).map(([k, s]) => {
+  const tabs = Object.entries(SORTS).filter(([k]) => k !== 'match' || v.ai).map(([k, s]) => {
     const on = v.sortKey === k;
     let dir = '';
     if (on && k !== 'shuffle') dir = k === 'orig' ? (v.sortDir < 0 ? ' (reversed)' : '') : (v.sortDir > 0 ? ' ↑' : ' ↓');
@@ -1289,10 +1471,12 @@ function renderList() {
   <div class="stick">
     <nav class="dividers" aria-label="Sort by">${tabs}</nav>
     <div class="list-tools">
-      <input type="search" id="row-filter" placeholder="Filter by song, artist or album" aria-label="Filter songs" value="${esc(v.filter)}">
+      <input type="search" id="row-filter" placeholder="Filter songs" aria-label="Filter by song, artist, album or genre" value="${esc(v.filter)}">
+      <button class="btn ai" data-act="ai-ask" aria-label="Ask AI to find songs that fit a description"><span class="spark">✦</span><span class="long">Ask AI</span></button>
       <button class="btn" data-act="toggle-select" aria-pressed="${v.selecting}">${v.selecting ? 'Done' : 'Select'}</button>
     </div>
   </div>
+  <div id="ai-banner" hidden></div>
   <ol class="rows" id="rows"></ol>
   <div class="bar" id="bar" hidden></div>`;
   renderRows();
@@ -1322,10 +1506,11 @@ function renderRows() {
   const st = $('#list-stats');
   if (v.loading) { rows.innerHTML = `<li class="empty">${esc(v.loading)}</li>`; if (st) st.textContent = ''; return; }
   syncPreviewUid(v);
+  renderAiBanner(v);
   const vis = visibleEntries(v);
   const total = v.entries.reduce((a, e) => a + e.dur, 0);
   if (st) st.textContent = `${plural(v.entries.length, 'song')} · ${fmtLong(total)}${v.filter.trim() ? ` · ${vis.length.toLocaleString()} shown` : ''}`;
-  if (!vis.length) { rows.innerHTML = `<li class="empty">${v.entries.length ? 'No songs match that filter.' : v.src.type === 'unsorted' ? 'Every liked song is in at least one of your playlists.' : 'Nothing in here yet.'}</li>`; return; }
+  if (!vis.length) { rows.innerHTML = `<li class="empty">${v.entries.length ? (v.aiOnly ? 'No strong matches. Tap Only matches to see every song ranked.' : 'No songs match that filter.') : v.src.type === 'unsorted' ? 'Every liked song is in at least one of your playlists.' : 'Nothing in here yet.'}</li>`; return; }
   const pos = new Map(v.order.map((u, i) => [u, i + 1]));
   rows.innerHTML = vis.map(e => rowHtml(v, e, pos.get(e.uid))).join('');
 }
@@ -1340,7 +1525,7 @@ function renderBar() {
       <div class="bar-actions"><button class="btn small ghost" data-act="sel-all">Select all shown</button>${n ? '<button class="btn small ghost" data-act="sel-none">Clear</button>' : ''}</div>
       <div class="bar-actions" style="flex-basis:100%">
         <button class="btn primary" data-act="sel-add" ${n ? '' : 'disabled'}>Add to…</button>
-        ${isPl ? `<button class="btn" data-act="sel-move" ${n ? '' : 'disabled'}>Move to…</button><button class="btn" data-act="sel-remove" ${n ? '' : 'disabled'}>Remove</button>` : `<button class="btn" data-act="sel-unlike" ${n ? '' : 'disabled'}>Unlike</button>`}
+        ${isPl ? `<button class="btn" data-act="sel-move" ${n ? '' : 'disabled'}>Move to…</button><button class="btn" data-act="sel-remove" ${n ? '' : 'disabled'}>Remove</button>` : v.src.type === 'ai' ? '' : `<button class="btn" data-act="sel-unlike" ${n ? '' : 'disabled'}>Unlike</button>`}
       </div>`;
   } else if (isDirty(v)) {
     if (v.canReorder) html = `<div class="bar-msg">New order isn't saved yet<small>${esc(sortLabel(v))}</small></div><div class="bar-actions"><button class="btn" data-act="reset">Undo sort</button><button class="btn primary" data-act="save">Save to Spotify</button></div>`;
@@ -1349,7 +1534,7 @@ function renderBar() {
   bar.innerHTML = html ? `<div class="bar-in">${html}</div>` : '';
   bar.hidden = !html;
 }
-const DIRS = { title: ['A to Z', 'Z to A'], artist: ['A to Z', 'Z to A'], album: ['A to Z', 'Z to A'], released: ['oldest first', 'newest first'], added: ['oldest first', 'newest first'], length: ['shortest first', 'longest first'], plays: ['fewest first', 'most first'], played: ['least first', 'most first'], last: ['longest ago first', 'most recent first'], genre: ['A to Z', 'Z to A'], bpm: ['slowest first', 'fastest first'], energy: ['calmest first', 'most energetic first'], mood: ['moodiest first', 'happiest first'] };
+const DIRS = { match: ['worst first', 'best first'], title: ['A to Z', 'Z to A'], artist: ['A to Z', 'Z to A'], album: ['A to Z', 'Z to A'], released: ['oldest first', 'newest first'], added: ['oldest first', 'newest first'], length: ['shortest first', 'longest first'], plays: ['fewest first', 'most first'], played: ['least first', 'most first'], last: ['longest ago first', 'most recent first'], genre: ['A to Z', 'Z to A'], bpm: ['slowest first', 'fastest first'], energy: ['calmest first', 'most energetic first'], mood: ['moodiest first', 'happiest first'] };
 function sortLabel(v) {
   if (v.sortKey === 'orig') return v.sortDir < 0 ? 'Reversed' : 'Original order';
   if (v.sortKey === 'shuffle') return 'Shuffled, artists spread out';
@@ -1358,6 +1543,7 @@ function sortLabel(v) {
 function sortWord(v) {
   if (v.sortKey === 'orig') return v.sortDir < 0 ? 'reversed' : 'copy';
   if (v.sortKey === 'shuffle') return 'shuffled';
+  if (v.sortKey === 'match') return 'AI picks';
   return 'by ' + (v.sortKey === 'bpm' ? 'BPM' : SORTS[v.sortKey].label.toLowerCase());
 }
 
@@ -1513,9 +1699,9 @@ async function openList(src, preset) {
 async function reloadView(keepSort) {
   const v = S.view;
   if (v.name !== 'list') return;
-  if (v.src.type !== 'unsorted') v.entries = await entriesFor(v.src, true);
+  if (v.src.type === 'playlist' || v.src.type === 'liked') v.entries = await entriesFor(v.src, true);
   v.sel = new Set([...v.sel].filter(u => v.entries.some(e => e.uid === u)));
-  if (!keepSort || v.sortKey === 'shuffle') { v.sortKey = 'orig'; v.sortDir = 1; }
+  if (!keepSort || v.sortKey === 'shuffle' || (v.sortKey === 'match' && !v.ai)) { v.sortKey = 'orig'; v.sortDir = 1; }
   applySort(v);
   render();
 }
@@ -1587,6 +1773,43 @@ const actions = {
     if (def.need) document.querySelector(`.tab[data-key="${k}"]`)?.scrollIntoView({ inline: 'center', block: 'nearest' });
   },
   'open-data': () => openData(),
+  'ai-ask': () => aiFlowList(),
+  'ai-library': () => aiFlowLibrary(),
+  'ai-only'() { const v = S.view; v.aiOnly = !v.aiOnly; renderRows(); renderBar(); },
+  'ai-clear'() { const v = S.view; v.ai = null; v.aiOnly = false; if (v.sortKey === 'match') { v.sortKey = 'orig'; v.sortDir = 1; } applySort(v); render(); },
+  async 'ai-save'() {
+    const v = S.view;
+    if (!v.ai) return;
+    const list = v.entries.filter(e => addable(e) && (v.ai.res.get(e.uri)?.s ?? -1) >= 7).sort((a, b) => v.ai.res.get(b.uri).s - v.ai.res.get(a.uri).s || a.pos - b.pos);
+    if (!list.length) return;
+    const def = v.ai.q.charAt(0).toUpperCase() + v.ai.q.slice(1);
+    const name = await askName('Save matches as a playlist', def.slice(0, 100), `${plural(list.length, 'song')}, best matches first.`, 'Create playlist');
+    if (!name) return;
+    await run(async () => {
+      const p = progress('Creating playlist');
+      const pl = await createPlaylist(name);
+      const r = await addSongs(pl, list, true, p);
+      toast(`Made “${pl.name}” with ${plural(r.added, 'song')}.`);
+    });
+  },
+  async 'ai-key'() {
+    const k = $('#ai-key').value.trim();
+    const err = $('#ai-key-err');
+    if (!k) { err.textContent = 'Paste your key first.'; return; }
+    if (!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(k)) { err.textContent = 'That doesn\'t look like a Claude API key. It starts with sk-ant-.'; return; }
+    const prev = store.get('aiKey');
+    store.set('aiKey', k);
+    S.busy = true;
+    const p = progress('Checking your key');
+    let problem = null;
+    try { await claudeCall('Reply with the single word OK.', 'Say OK.', 5); } catch (e) { problem = e; }
+    finally { S.busy = false; closeProgress(); }
+    if (problem && /accept your API key/.test(problem.message)) { if (prev) store.set('aiKey', prev); else store.del('aiKey'); render(); $('#ai-key-err').textContent = 'Claude didn\'t accept that key. Copy it again from Settings → API keys.'; return; }
+    render();
+    if (problem) toast(`Key saved, but: ${problem.message}`, 'warn');
+    else toast('Saved. Tap Ask AI on the home screen or any playlist.');
+  },
+  'ai-key-remove'() { store.del('aiKey'); render(); toast('Removed your Claude key from this browser.'); },
   preview: b => preview(b.dataset.uid),
   'preview-next': () => previewNext(),
   'preview-close': () => closePreview(),
@@ -1786,13 +2009,13 @@ function moreMenu() {
   const pl = isPl ? plById(v.src.id) : null;
   const u = isPl ? store.get('undo.' + v.src.id) : null;
   const items = [];
-  if (v.src.type !== 'unsorted') items.push(['dupes', 'Find duplicates', 'Repeats and different versions of the same song']);
+  if (v.src.type === 'playlist' || v.src.type === 'liked') items.push(['dupes', 'Find duplicates', 'Repeats and different versions of the same song']);
   items.push(['splitgenre', 'Split by genre', 'One new playlist per genre']);
   items.push(['split', 'Split into playlists', 'By decade, artist or the year you added them']);
   items.push(['saveas', 'Save as a new playlist', 'Uses the order and filter you see']);
   if (isPl && owned(pl)) items.push(['rename', 'Rename']);
   if (u) items.push(['undo', `Undo “${u.label}”`, ago(u.at)]);
-  if (v.src.type !== 'unsorted') items.push(['reload', 'Reload from Spotify']);
+  if (v.src.type === 'playlist' || v.src.type === 'liked') items.push(['reload', 'Reload from Spotify']);
   if (isPl) items.push(['delete', owned(pl) ? 'Delete playlist' : 'Remove from your library', '', 'danger']);
   ask(`<h2>${esc(v.title)}</h2><ul class="menu">${items.map(([k, b, s, cls]) => `<li><button class="${cls || ''}" data-res="${k}"><b>${esc(b)}</b>${s ? `<small>${esc(s)}</small>` : ''}</button></li>`).join('')}</ul><div class="actions"><button class="btn" data-res="cancel">Close</button></div>`)
     .then(k => {
@@ -2284,10 +2507,26 @@ const Demo = (() => {
     out.push({ ts: '2024-02-02T10:00:00Z', ms_played: 1000, master_metadata_track_name: null, master_metadata_album_artist_name: null, spotify_track_uri: null, episode_name: 'Some podcast' });
     return out;
   }
-  return { handle, lastfm, recco, sampleHistory, reset() { db = null; }, get db() { if (!db) build(); return db; } };
+  function aiScore(q, batch) {
+    const ql = q.toLowerCase(), out = new Map();
+    const calm = /chill|calm|relax|mellow|sleep|study|quiet|rain|soft|acoustic|sunday/.test(ql);
+    const up = /upbeat|happy|party|gym|workout|energy|dance|hype|run|feel-good/.test(ql);
+    const sad = /sad|melanchol|heartbreak|cry|moody|dark/.test(ql);
+    const words = ql.split(/[^a-z0-9&-]+/).filter(w => w.length > 3);
+    for (const e of batch) {
+      const f = feat(e), g = (genreOf(e) || '').toLowerCase(), tags = (D.genres[artistKey(e.artists[0])]?.t || []).join(' ');
+      let sc = 3;
+      if (f) { if (calm) sc += Math.round((0.55 - f.en) * 12); if (up) sc += Math.round((f.en + f.va - 0.9) * 7); if (sad) sc += Math.round((0.5 - f.va) * 12); }
+      if (words.some(w => g.includes(w) || tags.includes(w))) sc += 5;
+      sc = Math.max(0, Math.min(10, sc));
+      out.set(e.uri, { s: sc, why: [g ? prettyGenre(g) : '', f ? `${energyWord(f.en)}, ${moodWord(f.va)}` : 'not much data'].filter(Boolean).join(' · ') });
+    }
+    return out;
+  }
+  return { handle, lastfm, recco, sampleHistory, aiScore, reset() { db = null; }, get db() { if (!db) build(); return db; } };
 })();
 
-window.Crate = { S, D, P, Demo, planMoves, findDupes, stats, genreOf, feat, buildHistory, pickGenres, prettyGenre };
+window.Crate = { S, D, P, Demo, songLine, AI_SYSTEM, planMoves, findDupes, stats, genreOf, feat, buildHistory, pickGenres, prettyGenre };
 
 /* ---------------- boot ---------------- */
 (async function boot() {
